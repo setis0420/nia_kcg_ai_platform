@@ -34,6 +34,9 @@ global_model/
 global_model_v2/
 *.log
 
+# Prepared data
+prepared_data/
+
 # Temp files
 _temp/
 nul

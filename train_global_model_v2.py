@@ -528,17 +528,30 @@ def train_global_model_v2(
     val_seg_ids = seg_ids[:n_val_seg].tolist()
     train_seg_ids = seg_ids[n_val_seg:].tolist()
 
+    # train/val Dataset: 동일한 데이터 배열을 공유하고 인덱스만 분리
+    # (메모리 절약: 데이터 복사 없이 view만 다르게 사용)
     train_ds = dataset
-    val_ds = TrajectoryDatasetV2(
-        intp_all,
-        seq_len=seq_len,
-        stride=stride,
-        segment_bounds=segment_bounds,
-        cog_mirror=cog_mirror,
-        grid_info=grid_info,
-    )
-
     train_ds.set_active_segments(train_seg_ids)
+
+    # val_ds는 별도 객체지만 데이터 배열은 train_ds와 공유
+    val_ds = object.__new__(TrajectoryDatasetV2)
+    val_ds.seq_len = dataset.seq_len
+    val_ds.stride = dataset.stride
+    val_ds.cog_mirror = dataset.cog_mirror
+    val_ds.grid_info = dataset.grid_info
+    val_ds.numeric_cols = dataset.numeric_cols
+    val_ds.cat_cols = dataset.cat_cols
+    val_ds.target_cols = dataset.target_cols
+    val_ds.x_mean = dataset.x_mean
+    val_ds.x_std = dataset.x_std
+    val_ds.y_mean = dataset.y_mean
+    val_ds.y_std = dataset.y_std
+    val_ds.Xn_num = dataset.Xn_num  # 공유 (복사 없음)
+    val_ds.X_cat = dataset.X_cat    # 공유 (복사 없음)
+    val_ds.Yn = dataset.Yn          # 공유 (복사 없음)
+    val_ds.segment_bounds = dataset.segment_bounds
+    val_ds.segment_starts = dataset.segment_starts
+    val_ds.start_indices = []  # val용 인덱스
     val_ds.set_active_segments(val_seg_ids)
 
     if len(train_ds) == 0 or len(val_ds) == 0:
