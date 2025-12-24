@@ -109,11 +109,6 @@ class TrajectoryInferenceV2:
         else:
             self.seq_len = 80
 
-        if "step" in ckpt:
-            self.dt_minutes = int(ckpt["step"])
-        else:
-            self.dt_minutes = 1
-
         # Categorical vocab 로드
         self.mmsi_vocab = eval(str(ckpt["mmsi_vocab"]))
         self.start_vocab = eval(str(ckpt["start_vocab"]))
@@ -237,28 +232,33 @@ class TrajectoryInferenceV2:
 
         return clamped_lat, clamped_lon, out_of_bounds
 
-    def predict_multi_from_df(self, df, n_steps=80, dt_minutes=None,
+    def predict_multi_from_df(self, df, n_steps=80,
                               mmsi=None, start_area=None, end_area=None,
                               sog_clip=(0.0, 35.0),
+                              sog_min_ratio=0.7,
                               use_model_latlon=False,
                               enforce_bounds=True):
         """
-        다중 스텝 예측
+        다중 스텝 예측 (1분 간격)
 
         Parameters:
         -----------
-        df: 입력 DataFrame (datetime, lat, lon, sog, cog 필요)
+        df: 입력 DataFrame (datetime, lat, lon, sog, cog 필요, 1분 간격 보간 데이터)
         n_steps: 예측 스텝 수
         mmsi, start_area, end_area: Categorical 값 (None이면 df에서 추출)
+        sog_clip: SOG 클리핑 범위 (min, max)
+        sog_min_ratio: 입력 데이터 평균 SOG 대비 최소 비율 (0.7 = 70% 이상 유지)
         """
-        if dt_minutes is None:
-            dt_minutes = self.dt_minutes
 
         hist = self._prepare_hist(df, mmsi, start_area, end_area)
 
         # 수치형 피처
         X_num = hist[["lat","lon","sog","sin_cog","cos_cog"]].values.astype(np.float32)
         Xn_num = (X_num - self.x_mean) / self.x_std
+
+        # 입력 데이터의 평균 SOG를 기준으로 최소값 설정
+        input_sog_mean = float(hist["sog"].mean())
+        sog_min_threshold = input_sog_mean * sog_min_ratio
 
         # Categorical 피처 (시퀀스 전체에 동일 값)
         X_cat = np.zeros((self.seq_len, 4), dtype=np.int64)
@@ -290,19 +290,21 @@ class TrajectoryInferenceV2:
             pred_cog = np.degrees(np.arctan2(pred_sin, pred_cos))
             pred_cog = (pred_cog + 360) % 360
 
-            pred_sog = float(np.clip(pred_sog, sog_clip[0], sog_clip[1]))
+            # SOG 클리핑: 최소값은 입력 데이터 평균의 일정 비율 이상 유지
+            effective_sog_min = max(sog_clip[0], sog_min_threshold)
+            pred_sog = float(np.clip(pred_sog, effective_sog_min, sog_clip[1]))
 
             if use_model_latlon:
                 next_lat, next_lon = float(pred_lat_m), float(pred_lon_m)
             else:
-                next_lat, next_lon = step_latlon_dead_reckoning(cur_lat, cur_lon, pred_sog, pred_cog, dt_minutes=dt_minutes)
+                next_lat, next_lon = step_latlon_dead_reckoning(cur_lat, cur_lon, pred_sog, pred_cog, dt_minutes=1)
 
             if enforce_bounds:
                 next_lat, next_lon, violated = self._clamp_to_bounds(next_lat, next_lon, cur_lat, cur_lon)
                 if violated:
                     bound_violations += 1
 
-            last_time = last_time + pd.Timedelta(minutes=float(dt_minutes))
+            last_time = last_time + pd.Timedelta(minutes=1)
             preds.append([last_time, next_lat, next_lon, pred_sog, pred_cog])
 
             cur_lat, cur_lon = next_lat, next_lon

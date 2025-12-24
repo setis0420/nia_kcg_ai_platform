@@ -21,8 +21,8 @@ from torch.utils.data import Dataset, DataLoader
 # =========================
 # 하이퍼파라미터
 # =========================
-SEQ_LEN    = 80
-STEP_SIZE  = 3
+SEQ_LEN = 80
+STRIDE  = 3    # Sliding window 이동 간격 (학습 데이터 추출 시)
 EPOCHS     = 10
 BATCH_SIZE = 256
 LR         = 1e-3
@@ -169,10 +169,10 @@ class TrajectoryDatasetV2(Dataset):
     출력 타겟:
     - lat, lon, sog, sin_cog, cos_cog (5개)
     """
-    def __init__(self, df, seq_len=80, step=3, segment_bounds=None, cog_mirror=False,
+    def __init__(self, df, seq_len=80, stride=3, segment_bounds=None, cog_mirror=False,
                  grid_info=None):
         self.seq_len = seq_len
-        self.step = step
+        self.stride = stride
         self.cog_mirror = cog_mirror
         self.grid_info = grid_info
 
@@ -231,7 +231,7 @@ class TrajectoryDatasetV2(Dataset):
             starts = []
             max_start = e - 1 - self.seq_len
             if max_start >= s:
-                for i in range(s, max_start + 1, self.step):
+                for i in range(s, max_start + 1, self.stride):
                     starts.append(i)
             self.segment_starts.append(starts)
 
@@ -381,7 +381,7 @@ def encode_categorical(df, col_name, vocab=None):
 # =========================
 def train_global_model_v2(
     df_all,
-    seq_len=SEQ_LEN, step_size=STEP_SIZE,
+    seq_len=SEQ_LEN, stride=STRIDE,
     epochs=300,
     batch_size=BATCH_SIZE, lr=LR,
     save_dir=SAVE_DIR,
@@ -507,7 +507,7 @@ def train_global_model_v2(
     dataset = TrajectoryDatasetV2(
         intp_all,
         seq_len=seq_len,
-        step=step_size,
+        stride=stride,
         segment_bounds=segment_bounds,
         cog_mirror=cog_mirror,
         grid_info=grid_info,
@@ -532,7 +532,7 @@ def train_global_model_v2(
     val_ds = TrajectoryDatasetV2(
         intp_all,
         seq_len=seq_len,
-        step=step_size,
+        stride=stride,
         segment_bounds=segment_bounds,
         cog_mirror=cog_mirror,
         grid_info=grid_info,
@@ -584,7 +584,10 @@ def train_global_model_v2(
 
     # 체크포인트 저장을 위한 경로 미리 생성
     os.makedirs(save_dir, exist_ok=True)
-    model_path = os.path.join(save_dir, "lstm_global_v2.pth")
+    checkpoint_dir = os.path.join(save_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    model_path = os.path.join(save_dir, "lstm_global_v2.pth")  # best 모델
     scaler_path = os.path.join(save_dir, "scaler_global_v2.npz")
 
     print(f"[GLOBAL-V2] 학습 시작 | max_epochs={epochs}, warmup={warmup_epochs}, patience={patience}, device={device}")
@@ -652,6 +655,47 @@ def train_global_model_v2(
         if scheduler is not None:
             scheduler.step(va_loss)
 
+        # ---- 매 epoch마다 체크포인트 저장 ----
+        epoch_model_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pth")
+        epoch_scaler_path = os.path.join(checkpoint_dir, f"scaler_epoch_{epoch:03d}.npz")
+
+        torch.save(model.state_dict(), epoch_model_path)
+        np.savez(
+            epoch_scaler_path,
+            x_mean=train_ds.x_mean, x_std=train_ds.x_std,
+            y_mean=train_ds.y_mean, y_std=train_ds.y_std,
+            seq_len=int(seq_len),
+            stride=int(stride),
+            numeric_cols=np.array(train_ds.numeric_cols),
+            cat_cols=np.array(train_ds.cat_cols),
+            target_cols=np.array(train_ds.target_cols),
+            mmsi_vocab=str(mmsi_vocab),
+            start_vocab=str(start_vocab),
+            end_vocab=str(end_vocab),
+            num_mmsi=len(mmsi_vocab) + 1,
+            num_start_area=len(start_vocab) + 1,
+            num_end_area=len(end_vocab) + 1,
+            grid_info_lat_min=grid_info['lat_min'],
+            grid_info_lon_min=grid_info['lon_min'],
+            grid_info_lat_max=grid_info['lat_max'],
+            grid_info_lon_max=grid_info['lon_max'],
+            grid_size=grid_info['grid_size'],
+            num_rows=grid_info['num_rows'],
+            num_cols=grid_info['num_cols'],
+            total_grids=grid_info['total_grids'],
+            cog_mirror=bool(cog_mirror),
+            embed_dim=int(embed_dim),
+            epoch=int(epoch),
+            train_loss=float(tr_loss),
+            val_loss=float(va_loss),
+            smooth_lambda=float(smooth_lambda),
+            sog_lambda=float(sog_lambda),
+            heading_lambda=float(heading_lambda),
+            lat_bounds=np.array(lat_bounds),
+            lon_bounds=np.array(lon_bounds),
+        )
+        print(f"  [CHECKPOINT] epoch {epoch} 저장: {epoch_model_path}")
+
         improved = (best_val - va_loss) > min_delta
         if improved:
             best_val = va_loss
@@ -659,14 +703,14 @@ def train_global_model_v2(
             bad_count = 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-            # 체크포인트 저장 (validation loss 개선 시)
+            # best 모델 저장 (validation loss 개선 시)
             torch.save(model.state_dict(), model_path)
             np.savez(
                 scaler_path,
                 x_mean=train_ds.x_mean, x_std=train_ds.x_std,
                 y_mean=train_ds.y_mean, y_std=train_ds.y_std,
                 seq_len=int(seq_len),
-                step=int(step_size),
+                stride=int(stride),
                 numeric_cols=np.array(train_ds.numeric_cols),
                 cat_cols=np.array(train_ds.cat_cols),
                 target_cols=np.array(train_ds.target_cols),
@@ -694,7 +738,7 @@ def train_global_model_v2(
                 lat_bounds=np.array(lat_bounds),
                 lon_bounds=np.array(lon_bounds),
             )
-            print(f"  [CHECKPOINT] 모델 저장됨 (epoch={epoch}, val_loss={va_loss:.6f})")
+            print(f"  [BEST] 최고 모델 갱신됨 (epoch={epoch}, val_loss={va_loss:.6f})")
         else:
             bad_count += 1
 

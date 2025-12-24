@@ -31,4 +31,11 @@ Thumbs.db
 
 # Model outputs
 global_model/
+global_model_v2/
 *.log
+
+# Temp files
+_temp/
+nul
+*.png
+*.xlsx

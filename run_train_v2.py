@@ -185,8 +185,8 @@ def main():
                         help="학습률 (기본값: 0.001)")
     parser.add_argument("--seq_len", type=int, default=50,
                         help="시퀀스 길이 (기본값: 50)")
-    parser.add_argument("--step_size", type=int, default=3,
-                        help="스텝 크기 (기본값: 3)")
+    parser.add_argument("--stride", type=int, default=3,
+                        help="Sliding window 이동 간격 (기본값: 3)")
 
     # Early stopping
     parser.add_argument("--patience", type=int, default=20,
@@ -254,7 +254,7 @@ def main():
         turn_boost=args.turn_boost,
         val_ratio=args.val_ratio,
         seq_len=args.seq_len,
-        step_size=args.step_size,
+        stride=args.stride,
         batch_size=args.batch_size,
         device=args.device,
         save_dir=args.save_dir,
