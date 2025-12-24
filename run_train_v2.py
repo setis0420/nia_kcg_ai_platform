@@ -1,17 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-선박 항적 예측 모델 V2 학습 실행 파일
-========================================
+선박 항적 예측 모델 V2 학습 실행 파일 (범용 모델)
+================================================
 추가 기능:
 - 파일명에서 mmsi, start_area, end_area 추출
-- Categorical 변수로 Embedding
+- Categorical 변수로 Embedding (내부 변수로 처리)
 - 격자 ID 기반 위치 정보
+- 모든 구간 데이터 통합 학습
 
 사용법:
     python run_train_v2.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \
                            --transition_folder "area_transition_results" \
-                           --start_area "남쪽 진입" \
-                           --end_area "여수정박지B" \
                            --epochs 300 \
                            --device cuda
 """
@@ -80,25 +79,25 @@ def load_transition_data(transition_folder: str) -> pd.DataFrame:
 def load_trajectory_data(
     transition_df: pd.DataFrame,
     data_folder: str,
-    start_area: str,
-    end_area: str
 ) -> pd.DataFrame:
     """
-    지정된 시작/도착 구역에 해당하는 항적 데이터 로드
+    모든 구간의 항적 데이터 로드 (범용 모델)
 
     V2: 파일명에서 mmsi, start_area, end_area 추출하여 컬럼으로 추가
     """
 
-    # 시작/도착 구역 필터링
-    filtered_df = transition_df[
-        (transition_df.start_area == start_area) &
-        (transition_df.end_area == end_area)
-    ].reset_index(drop=True)
+    # 모든 구간 사용
+    filtered_df = transition_df.reset_index(drop=True)
 
     if len(filtered_df) == 0:
-        raise ValueError(f"해당 구간 데이터가 없습니다: {start_area} -> {end_area}")
+        raise ValueError("전이 정보 데이터가 없습니다.")
 
-    print(f"[INFO] 구간 필터링: {start_area} -> {end_area}, {len(filtered_df)} 건")
+    # 구간 통계 출력
+    unique_routes = filtered_df.groupby(['start_area', 'end_area']).size()
+    print(f"[INFO] 전체 구간 데이터: {len(filtered_df)} 건")
+    print(f"[INFO] 구간 종류: {len(unique_routes)} 개")
+    for (s, e), cnt in unique_routes.items():
+        print(f"       - {s} -> {e}: {cnt} 건")
 
     all_results = []
     success_count = 0
@@ -155,18 +154,17 @@ def load_trajectory_data(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="선박 항적 예측 모델 V2 학습 (Categorical + Grid)",
+        description="선박 항적 예측 모델 V2 학습 (범용 모델 - Categorical + Grid)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
   python run_train_v2.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \\
                          --transition_folder "area_transition_results" \\
-                         --start_area "남쪽 진입" \\
-                         --end_area "여수정박지B" \\
                          --epochs 300
 
 추가된 기능 (V2):
-  - 파일명에서 mmsi, start_area, end_area 추출
+  - 파일명에서 mmsi, start_area, end_area 추출 (내부 Categorical 변수)
+  - 모든 구간 데이터 통합 학습 (범용 모델)
   - Categorical 변수 Embedding
   - 격자 ID (0.05도 단위) 기반 위치 정보
         """
@@ -177,10 +175,6 @@ def main():
                         help="항적 CSV 파일이 저장된 폴더 경로")
     parser.add_argument("--transition_folder", type=str, required=True,
                         help="전이 정보 CSV 파일이 저장된 폴더 경로")
-    parser.add_argument("--start_area", type=str, required=True,
-                        help="시작 구역 이름")
-    parser.add_argument("--end_area", type=str, required=True,
-                        help="도착 구역 이름")
 
     # 학습 하이퍼파라미터
     parser.add_argument("--epochs", type=int, default=300,
@@ -226,12 +220,11 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60)
-    print("선박 항적 예측 모델 V2 학습")
+    print("선박 항적 예측 모델 V2 학습 (범용 모델)")
     print("(Categorical 변수 + 격자 ID)")
     print("=" * 60)
     print(f"데이터 폴더: {args.data_folder}")
     print(f"전이 정보 폴더: {args.transition_folder}")
-    print(f"구간: {args.start_area} -> {args.end_area}")
     print(f"장치: {args.device}")
     print(f"Embedding 차원: {args.embed_dim}")
     print(f"격자 크기: {args.grid_size}도")
@@ -241,13 +234,11 @@ def main():
     print("\n[STEP 1] 전이 정보 로드")
     transition_df = load_transition_data(args.transition_folder)
 
-    # 2. 항적 데이터 로드
-    print("\n[STEP 2] 항적 데이터 로드")
+    # 2. 항적 데이터 로드 (모든 구간)
+    print("\n[STEP 2] 항적 데이터 로드 (모든 구간)")
     trajectory_df = load_trajectory_data(
         transition_df,
         args.data_folder,
-        args.start_area,
-        args.end_area
     )
 
     # 3. 모델 학습

@@ -582,8 +582,14 @@ def train_global_model_v2(
     bad_count = 0
     best_state = None
 
+    # 체크포인트 저장을 위한 경로 미리 생성
+    os.makedirs(save_dir, exist_ok=True)
+    model_path = os.path.join(save_dir, "lstm_global_v2.pth")
+    scaler_path = os.path.join(save_dir, "scaler_global_v2.npz")
+
     print(f"[GLOBAL-V2] 학습 시작 | max_epochs={epochs}, warmup={warmup_epochs}, patience={patience}, device={device}")
     print(f"[GLOBAL-V2] Embedding dim={embed_dim}")
+    print(f"[GLOBAL-V2] 체크포인트 저장 위치: {save_dir}")
 
     for epoch in range(1, epochs + 1):
         # ---- train
@@ -652,6 +658,43 @@ def train_global_model_v2(
             best_epoch = epoch
             bad_count = 0
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+            # 체크포인트 저장 (validation loss 개선 시)
+            torch.save(model.state_dict(), model_path)
+            np.savez(
+                scaler_path,
+                x_mean=train_ds.x_mean, x_std=train_ds.x_std,
+                y_mean=train_ds.y_mean, y_std=train_ds.y_std,
+                seq_len=int(seq_len),
+                step=int(step_size),
+                numeric_cols=np.array(train_ds.numeric_cols),
+                cat_cols=np.array(train_ds.cat_cols),
+                target_cols=np.array(train_ds.target_cols),
+                mmsi_vocab=str(mmsi_vocab),
+                start_vocab=str(start_vocab),
+                end_vocab=str(end_vocab),
+                num_mmsi=len(mmsi_vocab) + 1,
+                num_start_area=len(start_vocab) + 1,
+                num_end_area=len(end_vocab) + 1,
+                grid_info_lat_min=grid_info['lat_min'],
+                grid_info_lon_min=grid_info['lon_min'],
+                grid_info_lat_max=grid_info['lat_max'],
+                grid_info_lon_max=grid_info['lon_max'],
+                grid_size=grid_info['grid_size'],
+                num_rows=grid_info['num_rows'],
+                num_cols=grid_info['num_cols'],
+                total_grids=grid_info['total_grids'],
+                cog_mirror=bool(cog_mirror),
+                embed_dim=int(embed_dim),
+                best_epoch=int(best_epoch),
+                best_val=float(best_val),
+                smooth_lambda=float(smooth_lambda),
+                sog_lambda=float(sog_lambda),
+                heading_lambda=float(heading_lambda),
+                lat_bounds=np.array(lat_bounds),
+                lon_bounds=np.array(lon_bounds),
+            )
+            print(f"  [CHECKPOINT] 모델 저장됨 (epoch={epoch}, val_loss={va_loss:.6f})")
         else:
             bad_count += 1
 
@@ -663,69 +706,8 @@ def train_global_model_v2(
             print(f"[GLOBAL-V2] Stop: lr reached min_lr (best={best_epoch}, val={best_val:.6f})")
             break
 
-    # best 복원
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    # --------------------
-    # 저장
-    # --------------------
-    os.makedirs(save_dir, exist_ok=True)
-    model_path  = os.path.join(save_dir, "lstm_global_v2.pth")
-    scaler_path = os.path.join(save_dir, "scaler_global_v2.npz")
-
-    torch.save(model.state_dict(), model_path)
-
-    np.savez(
-        scaler_path,
-        # 정규화 파라미터
-        x_mean=train_ds.x_mean, x_std=train_ds.x_std,
-        y_mean=train_ds.y_mean, y_std=train_ds.y_std,
-
-        # 시퀀스 정보
-        seq_len=int(seq_len),
-        step=int(step_size),
-
-        # 피처 컬럼
-        numeric_cols=np.array(train_ds.numeric_cols),
-        cat_cols=np.array(train_ds.cat_cols),
-        target_cols=np.array(train_ds.target_cols),
-
-        # Categorical vocab (JSON 문자열로 저장)
-        mmsi_vocab=str(mmsi_vocab),
-        start_vocab=str(start_vocab),
-        end_vocab=str(end_vocab),
-        num_mmsi=len(mmsi_vocab) + 1,
-        num_start_area=len(start_vocab) + 1,
-        num_end_area=len(end_vocab) + 1,
-
-        # 격자 정보
-        grid_info_lat_min=grid_info['lat_min'],
-        grid_info_lon_min=grid_info['lon_min'],
-        grid_info_lat_max=grid_info['lat_max'],
-        grid_info_lon_max=grid_info['lon_max'],
-        grid_size=grid_info['grid_size'],
-        num_rows=grid_info['num_rows'],
-        num_cols=grid_info['num_cols'],
-        total_grids=grid_info['total_grids'],
-
-        # 기타 설정
-        cog_mirror=bool(cog_mirror),
-        embed_dim=int(embed_dim),
-        best_epoch=int(best_epoch),
-        best_val=float(best_val),
-
-        # smoothness
-        smooth_lambda=float(smooth_lambda),
-        sog_lambda=float(sog_lambda),
-        heading_lambda=float(heading_lambda),
-
-        # 항로 범위
-        lat_bounds=np.array(lat_bounds),
-        lon_bounds=np.array(lon_bounds),
-    )
-
-    print(f"[GLOBAL-V2] 저장 완료(best) epoch={best_epoch}, val={best_val:.6f}")
+    # 학습 완료 메시지 (체크포인트는 이미 저장됨)
+    print(f"\n[GLOBAL-V2] 학습 완료! best epoch={best_epoch}, val={best_val:.6f}")
     print(f"  - {model_path}")
     print(f"  - {scaler_path}")
 
