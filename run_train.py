@@ -3,7 +3,7 @@
 선박 항적 예측 모델 학습 실행 파일
 ============================================
 사용법:
-    python run_train.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \
+    python run_train.py --data_folder "D:/project/NIA_선박항적예측프로그램/NIA_ai_project/항적데이터 추출/여수" \
                         --transition_folder "area_transition_results" \
                         --start_area "남쪽 진입" \
                         --end_area "여수정박지B" \
@@ -119,7 +119,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
-  python run_train.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \\
+  python run_train.py --data_folder "D:/project/NIA_선박항적예측프로그램/NIA_ai_project/항적데이터 추출/여수" \\
                       --transition_folder "area_transition_results" \\
                       --start_area "남쪽 진입" \\
                       --end_area "여수정박지B" \\

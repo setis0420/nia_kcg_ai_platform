@@ -372,7 +372,7 @@ def train_global_model(
     scheduler = None
     if use_scheduler:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=lr_factor, patience=lr_patience, min_lr=min_lr, verbose=True
+            optimizer, mode="min", factor=lr_factor, patience=lr_patience, min_lr=min_lr
         )
 
     # --------------------
@@ -442,6 +442,20 @@ def train_global_model(
 
         if scheduler is not None:
             scheduler.step(va_loss)
+
+        # 매 에폭마다 체크포인트 저장
+        checkpoint_dir = os.path.join(save_dir, "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_path = os.path.join(checkpoint_dir, f"lstm_epoch_{epoch:03d}_train_{tr_loss:.6f}_val_{va_loss:.6f}.pth")
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_loss': tr_loss,
+            'val_loss': va_loss,
+            'lr': cur_lr,
+        }, checkpoint_path)
+        print(f"  💾 Checkpoint saved: {checkpoint_path}")
 
         improved = (best_val - va_loss) > min_delta
         if improved:
