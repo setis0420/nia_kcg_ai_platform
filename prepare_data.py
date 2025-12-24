@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-학습 데이터 전처리 및 저장
-==========================
-원본 CSV 데이터를 읽어서 보간, 정규화, 시퀀스 생성 후 npz 파일로 저장
+학습 데이터 전처리 및 저장 (메모리 효율 버전)
+=============================================
+파일을 하나씩 처리하여 메모리 사용량 최소화
 
 사용법:
     python prepare_data.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \
@@ -12,7 +12,9 @@
 """
 
 import os
+import gc
 import argparse
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 import warnings
@@ -23,11 +25,11 @@ warnings.filterwarnings("ignore")
 GRID_SIZE = 0.05
 
 
-def compute_grid_id(lat, lon, lat_min, lon_min, grid_size=0.05):
+def compute_grid_id(lat, lon, lat_min, lon_min, grid_size, num_cols):
     """위경도를 격자 ID로 변환"""
-    grid_row = ((lat - lat_min) / grid_size).astype(int)
-    grid_col = ((lon - lon_min) / grid_size).astype(int)
-    return grid_row, grid_col
+    grid_row = int((lat - lat_min) / grid_size)
+    grid_col = int((lon - lon_min) / grid_size)
+    return grid_row * num_cols + grid_col
 
 
 def create_grid_mapping(lat_min, lat_max, lon_min, lon_max, grid_size=0.05):
@@ -75,7 +77,7 @@ def data_intp(df):
     for col in ["lat", "lon", "sog", "cog"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    keep_cols = [c for c in df.columns if c in ["datetime","mmsi","lat","lon","sog","cog","fid","start_area","end_area","mmsi_id","start_area_id","end_area_id"]]
+    keep_cols = [c for c in df.columns if c in ["datetime","mmsi","lat","lon","sog","cog","fid","start_area","end_area"]]
     df = df[keep_cols].dropna(subset=["datetime", "lat", "lon", "sog", "cog"])
     if df.empty:
         return None
@@ -89,10 +91,8 @@ def data_intp(df):
     range_df = pd.DataFrame({"datetime": dt_range})
     range_df["mmsi"] = df["mmsi"].iloc[0] if "mmsi" in df.columns else np.nan
     range_df["fid"] = df["fid"].iloc[0] if "fid" in df.columns else np.nan
-
-    for cat_col in ["mmsi_id", "start_area_id", "end_area_id"]:
-        if cat_col in df.columns:
-            range_df[cat_col] = df[cat_col].iloc[0]
+    range_df["start_area"] = df["start_area"].iloc[0] if "start_area" in df.columns else "unknown"
+    range_df["end_area"] = df["end_area"].iloc[0] if "end_area" in df.columns else "unknown"
 
     merge_df = (
         pd.concat([df, range_df], axis=0)
@@ -118,16 +118,6 @@ def data_intp(df):
     intp_df = intp_df.drop(columns=["sin_course","cos_course"], errors="ignore").reset_index()
     intp_df = intp_df.dropna(subset=["lat","lon","sog","cog"])
     return intp_df
-
-
-def encode_categorical(df, col_name, vocab=None):
-    """문자열을 정수 ID로 인코딩"""
-    if vocab is None:
-        unique_vals = df[col_name].unique()
-        vocab = {v: i+1 for i, v in enumerate(unique_vals)}  # 0은 unknown용
-
-    df[f"{col_name}_id"] = df[col_name].map(vocab).fillna(0).astype(int)
-    return vocab
 
 
 def parse_filename(filename):
@@ -166,27 +156,16 @@ def load_transition_data(transition_folder):
     return merged_df
 
 
-def load_trajectory_data(transition_df, data_folder):
-    """모든 구간의 항적 데이터 로드"""
-    filtered_df = transition_df.reset_index(drop=True)
+def get_file_list(transition_df, data_folder):
+    """유효한 파일 목록 생성"""
+    file_list = []
 
-    if len(filtered_df) == 0:
-        raise ValueError("전이 정보 데이터가 없습니다.")
-
-    unique_routes = filtered_df.groupby(['start_area', 'end_area']).size()
-    print(f"[INFO] 전체 구간 데이터: {len(filtered_df)} 건")
-    print(f"[INFO] 구간 종류: {len(unique_routes)} 개")
-
-    all_results = []
-    success_count = 0
-    fail_count = 0
-
-    for i in range(len(filtered_df)):
-        mmsi = filtered_df.mmsi.iloc[i]
-        s_area = filtered_df.start_area.iloc[i]
-        e_area = filtered_df.end_area.iloc[i]
-        start_time = pd.to_datetime(filtered_df.start_time.iloc[i]) - pd.Timedelta('1 hour')
-        end_time = pd.to_datetime(filtered_df.end_time.iloc[i]) + pd.Timedelta('1 hour')
+    for i in range(len(transition_df)):
+        mmsi = transition_df.mmsi.iloc[i]
+        s_area = transition_df.start_area.iloc[i]
+        e_area = transition_df.end_area.iloc[i]
+        start_time = pd.to_datetime(transition_df.start_time.iloc[i]) - pd.Timedelta('1 hour')
+        end_time = pd.to_datetime(transition_df.end_time.iloc[i]) + pd.Timedelta('1 hour')
 
         start_time_str = start_time.strftime("%Y%m%d%H%M%S")
         end_time_str = end_time.strftime("%Y%m%d%H%M%S")
@@ -194,192 +173,350 @@ def load_trajectory_data(transition_df, data_folder):
         filename = f'{mmsi}_{s_area}_{e_area}_{start_time_str}_{end_time_str}.csv'
         filepath = os.path.join(data_folder, filename)
 
-        if not os.path.exists(filepath):
-            fail_count += 1
-            continue
+        if os.path.exists(filepath):
+            file_list.append({
+                'filepath': filepath,
+                'filename': filename,
+                'fid': i,
+                'mmsi': mmsi,
+                'start_area': s_area,
+                'end_area': e_area,
+            })
 
-        try:
-            trj = pd.read_csv(filepath, encoding='cp949')
-            trj = trj.loc[:, ~trj.columns.str.contains('^Unnamed')]
-            trj['fid'] = i
-
-            parsed_mmsi, parsed_start, parsed_end = parse_filename(filename)
-            trj['start_area'] = parsed_start if parsed_start else s_area
-            trj['end_area'] = parsed_end if parsed_end else e_area
-
-            all_results.append(trj)
-            success_count += 1
-        except Exception as e:
-            print(f"[WARN] 파일 로드 실패: {filepath}, {e}")
-            fail_count += 1
-
-    if len(all_results) == 0:
-        raise ValueError("로드된 항적 데이터가 없습니다.")
-
-    result_df = pd.concat(all_results, ignore_index=True)
-    print(f"[INFO] 항적 데이터 로드 완료: {success_count} 성공, {fail_count} 실패")
-    print(f"[INFO] 총 데이터 행: {len(result_df)}")
-
-    return result_df
+    return file_list
 
 
-def prepare_training_data(
-    df_all,
-    seq_len=50,
-    stride=3,
-    grid_size=0.05,
-    cog_mirror=True,
-    seed=42,
-):
-    """
-    학습 데이터 전처리 및 시퀀스 생성
+def process_single_file(file_info, cog_mirror=True):
+    """단일 파일 처리 (보간)"""
+    try:
+        trj = pd.read_csv(file_info['filepath'], encoding='cp949')
+        trj = trj.loc[:, ~trj.columns.str.contains('^Unnamed')]
+        trj['fid'] = file_info['fid']
 
-    Returns:
-        dict: 학습에 필요한 모든 데이터와 메타정보
-    """
-    print("=" * 60)
-    print("[STEP 1] 데이터 전처리 시작")
-    print("=" * 60)
+        parsed_mmsi, parsed_start, parsed_end = parse_filename(file_info['filename'])
+        trj['start_area'] = parsed_start if parsed_start else file_info['start_area']
+        trj['end_area'] = parsed_end if parsed_end else file_info['end_area']
 
-    # 필수 컬럼 확인
-    required = ["datetime", "mmsi", "lat", "lon", "sog", "cog", "fid"]
-    missing = [c for c in required if c not in df_all.columns]
-    if missing:
-        raise ValueError(f"필수 컬럼 누락: {missing}")
+        # datetime 변환
+        trj["datetime"] = pd.to_datetime(trj["datetime"], errors="coerce")
+        for c in ["lat", "lon", "sog", "cog", "mmsi"]:
+            if c in trj.columns:
+                trj[c] = pd.to_numeric(trj[c], errors="coerce")
+        trj = trj.dropna(subset=["datetime", "lat", "lon", "sog", "cog"])
 
-    df_all = df_all.copy()
-    df_all["datetime"] = pd.to_datetime(df_all["datetime"], errors="coerce")
-    for c in ["lat", "lon", "sog", "cog", "mmsi", "fid"]:
-        df_all[c] = pd.to_numeric(df_all[c], errors="coerce")
-    df_all = df_all.dropna(subset=["datetime", "lat", "lon", "sog", "cog", "fid", "mmsi"])
-    df_all = df_all.sort_values(["fid", "datetime"]).reset_index(drop=True)
+        if trj.empty:
+            return []
 
-    print(f"[INFO] 원본 rows={len(df_all)}, fid={df_all.fid.nunique()}, mmsi={df_all.mmsi.nunique()}")
+        # 시간 간격으로 segment 분리 및 보간
+        segments = split_by_gap(trj, max_gap_days=1)
 
-    # Categorical 인코딩
-    if "start_area" not in df_all.columns or "end_area" not in df_all.columns:
-        print("[INFO] start_area/end_area 컬럼 없음 - 기본값 사용")
-        df_all["start_area"] = "unknown"
-        df_all["end_area"] = "unknown"
-
-    mmsi_vocab = encode_categorical(df_all, "mmsi")
-    start_vocab = encode_categorical(df_all, "start_area")
-    end_vocab = encode_categorical(df_all, "end_area")
-
-    print(f"[INFO] Categorical 인코딩:")
-    print(f"  - MMSI: {len(mmsi_vocab)} 종류")
-    print(f"  - Start Area: {len(start_vocab)} 종류")
-    print(f"  - End Area: {len(end_vocab)} 종류")
-
-    # 보간 + segment_bounds 생성
-    print("\n[STEP 2] 1분 간격 보간 및 시퀀스 생성")
-    intp_segments = []
-    seg_lengths = []
-
-    for fid, df_fid in df_all.groupby("fid"):
-        segments_raw = split_by_gap(df_fid, max_gap_days=1)
-        for seg_df in segments_raw:
+        results = []
+        for seg_df in segments:
             intp_df = data_intp(seg_df)
-            if intp_df is None or len(intp_df) == 0:
+            if intp_df is not None and len(intp_df) > 0:
+                intp_df = intp_df.sort_values("datetime").reset_index(drop=True)
+
+                # sin/cos 계산
+                sin_cog = np.sin(np.radians(intp_df["cog"].values))
+                cos_cog = np.cos(np.radians(intp_df["cog"].values))
+                if cog_mirror:
+                    sin_cog = -sin_cog
+
+                intp_df["sin_cog"] = sin_cog
+                intp_df["cos_cog"] = cos_cog
+
+                results.append(intp_df)
+
+        return results
+
+    except Exception as e:
+        print(f"[WARN] 파일 처리 실패: {file_info['filepath']}, {e}")
+        return []
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="학습 데이터 전처리 및 저장 (메모리 효율 버전)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument("--data_folder", type=str, required=True,
+                        help="항적 CSV 파일이 저장된 폴더")
+    parser.add_argument("--transition_folder", type=str, required=True,
+                        help="전이 정보 CSV 파일이 저장된 폴더")
+    parser.add_argument("--output_dir", type=str, default="prepared_data",
+                        help="전처리된 데이터 저장 폴더 (기본값: prepared_data)")
+    parser.add_argument("--seq_len", type=int, default=50,
+                        help="시퀀스 길이 (기본값: 50)")
+    parser.add_argument("--stride", type=int, default=3,
+                        help="슬라이딩 윈도우 이동 간격 (기본값: 3)")
+    parser.add_argument("--grid_size", type=float, default=0.05,
+                        help="격자 크기 (도 단위, 기본값: 0.05)")
+
+    args = parser.parse_args()
+
+    seq_len = args.seq_len
+    stride = args.stride
+    grid_size = args.grid_size
+    cog_mirror = True
+
+    print("=" * 60)
+    print("학습 데이터 전처리 (메모리 효율 버전)")
+    print("=" * 60)
+    print(f"데이터 폴더: {args.data_folder}")
+    print(f"전이 정보 폴더: {args.transition_folder}")
+    print(f"출력 폴더: {args.output_dir}")
+    print(f"시퀀스 길이: {seq_len}")
+    print(f"Stride: {stride}")
+    print(f"격자 크기: {grid_size}도")
+    print("=" * 60)
+
+    # 출력 폴더 생성
+    os.makedirs(args.output_dir, exist_ok=True)
+    segments_dir = os.path.join(args.output_dir, "segments")
+    os.makedirs(segments_dir, exist_ok=True)
+
+    # 1. 전이 정보 로드
+    print("\n[STEP 1] 파일 목록 생성")
+    transition_df = load_transition_data(args.transition_folder)
+    file_list = get_file_list(transition_df, args.data_folder)
+    print(f"[INFO] 유효한 파일 수: {len(file_list)}")
+
+    # ==============================================
+    # PASS 1: 통계 수집 (파일 하나씩 처리)
+    # ==============================================
+    print("\n[STEP 2] 통계 수집 (Pass 1)")
+
+    # 온라인 통계 계산을 위한 변수
+    n_total = 0
+    sum_x = np.zeros(5, dtype=np.float64)  # lat, lon, sog, sin_cog, cos_cog
+    sum_x2 = np.zeros(5, dtype=np.float64)
+
+    lat_min, lat_max = float('inf'), float('-inf')
+    lon_min, lon_max = float('inf'), float('-inf')
+
+    mmsi_set = set()
+    start_area_set = set()
+    end_area_set = set()
+
+    segment_info_list = []  # (file_idx, seg_idx, length, fid, mmsi, start_area, end_area)
+
+    for file_idx, file_info in enumerate(file_list):
+        if file_idx % 100 == 0:
+            print(f"  처리 중: {file_idx}/{len(file_list)}")
+
+        segments = process_single_file(file_info, cog_mirror=cog_mirror)
+
+        for seg_idx, seg_df in enumerate(segments):
+            n = len(seg_df)
+            if n < seq_len + 1:
                 continue
-            intp_df = intp_df.sort_values("datetime").reset_index(drop=True)
-            intp_segments.append(intp_df)
-            seg_lengths.append(len(intp_df))
 
-    if len(intp_segments) == 0:
-        raise RuntimeError("보간된 segment가 없습니다.")
+            # 수치 데이터
+            x = np.column_stack([
+                seg_df["lat"].values,
+                seg_df["lon"].values,
+                seg_df["sog"].values,
+                seg_df["sin_cog"].values,
+                seg_df["cos_cog"].values,
+            ]).astype(np.float64)
 
-    intp_all = pd.concat(intp_segments, ignore_index=True)
-    del intp_segments  # 메모리 해제
+            # 온라인 통계 업데이트
+            n_total += n
+            sum_x += x.sum(axis=0)
+            sum_x2 += (x ** 2).sum(axis=0)
 
-    segment_bounds = []
-    s = 0
-    for L in seg_lengths:
-        e = s + L
-        segment_bounds.append((s, e))
-        s = e
+            # 범위 업데이트
+            lat_min = min(lat_min, seg_df["lat"].min())
+            lat_max = max(lat_max, seg_df["lat"].max())
+            lon_min = min(lon_min, seg_df["lon"].min())
+            lon_max = max(lon_max, seg_df["lon"].max())
 
-    print(f"[INFO] 보간 후 rows={len(intp_all)}, segments={len(segment_bounds)}")
+            # Categorical 수집
+            mmsi_set.add(file_info['mmsi'])
+            start_area_set.add(seg_df["start_area"].iloc[0])
+            end_area_set.add(seg_df["end_area"].iloc[0])
 
-    # 격자 정보 생성
-    lat_min, lat_max = intp_all["lat"].min(), intp_all["lat"].max()
-    lon_min, lon_max = intp_all["lon"].min(), intp_all["lon"].max()
+            # segment 정보 저장
+            segment_info_list.append({
+                'file_idx': file_idx,
+                'seg_idx': seg_idx,
+                'length': n,
+                'fid': file_info['fid'],
+                'mmsi': file_info['mmsi'],
+                'start_area': seg_df["start_area"].iloc[0],
+                'end_area': seg_df["end_area"].iloc[0],
+            })
 
+        del segments
+        gc.collect()
+
+    print(f"[INFO] 유효 segment 수: {len(segment_info_list)}")
+    print(f"[INFO] 총 데이터 포인트: {n_total}")
+
+    if n_total == 0:
+        raise RuntimeError("처리된 데이터가 없습니다.")
+
+    # 평균/표준편차 계산
+    x_mean = (sum_x / n_total).astype(np.float32).reshape(1, -1)
+    x_var = (sum_x2 / n_total) - (sum_x / n_total) ** 2
+    x_std = (np.sqrt(np.maximum(x_var, 1e-12)) + 1e-6).astype(np.float32).reshape(1, -1)
+
+    # y도 동일 (다음 스텝 예측)
+    y_mean = x_mean.copy()
+    y_std = x_std.copy()
+
+    print(f"[INFO] x_mean: {x_mean}")
+    print(f"[INFO] x_std: {x_std}")
+
+    # 격자 정보
     lat_margin = (lat_max - lat_min) * 0.05
     lon_margin = (lon_max - lon_min) * 0.05
     lat_bounds = (lat_min - lat_margin, lat_max + lat_margin)
     lon_bounds = (lon_min - lon_margin, lon_max + lon_margin)
 
     grid_info = create_grid_mapping(
-        lat_min - lat_margin, lat_max + lat_margin,
-        lon_min - lon_margin, lon_max + lon_margin,
+        lat_bounds[0], lat_bounds[1],
+        lon_bounds[0], lon_bounds[1],
         grid_size
     )
 
     print(f"[INFO] 항로 범위: lat={lat_bounds[0]:.4f}~{lat_bounds[1]:.4f}, lon={lon_bounds[0]:.4f}~{lon_bounds[1]:.4f}")
-    print(f"[INFO] 격자: {grid_info['num_rows']}x{grid_info['num_cols']} = {grid_info['total_grids']} (크기: {grid_size}도)")
+    print(f"[INFO] 격자: {grid_info['num_rows']}x{grid_info['num_cols']} = {grid_info['total_grids']}")
 
-    # sin/cos 변환
-    sin_cog = np.sin(np.radians(intp_all["cog"].values))
-    cos_cog = np.cos(np.radians(intp_all["cog"].values))
-    if cog_mirror:
-        sin_cog = -sin_cog
+    # Vocab 생성
+    mmsi_vocab = {v: i+1 for i, v in enumerate(sorted(mmsi_set))}
+    start_vocab = {v: i+1 for i, v in enumerate(sorted(start_area_set))}
+    end_vocab = {v: i+1 for i, v in enumerate(sorted(end_area_set))}
 
-    # 격자 ID 계산
-    grid_row, grid_col = compute_grid_id(
-        intp_all["lat"].values, intp_all["lon"].values,
-        grid_info['lat_min'], grid_info['lon_min'],
-        grid_info['grid_size']
-    )
-    grid_row = np.clip(grid_row, 0, grid_info['num_rows'] - 1)
-    grid_col = np.clip(grid_col, 0, grid_info['num_cols'] - 1)
-    grid_id = grid_row * grid_info['num_cols'] + grid_col
+    print(f"[INFO] MMSI: {len(mmsi_vocab)} 종류")
+    print(f"[INFO] Start Area: {len(start_vocab)} 종류")
+    print(f"[INFO] End Area: {len(end_vocab)} 종류")
 
-    # 수치형 데이터 배열
-    X_num = np.column_stack([
-        intp_all["lat"].values,
-        intp_all["lon"].values,
-        intp_all["sog"].values,
-        sin_cog,
-        cos_cog
-    ]).astype(np.float32)
+    # ==============================================
+    # PASS 2: 정규화 및 저장 (파일 단위로 처리)
+    # ==============================================
+    print("\n[STEP 3] 정규화 및 저장 (Pass 2)")
 
-    # Categorical 데이터 배열
-    X_cat = np.column_stack([
-        intp_all["mmsi_id"].values if "mmsi_id" in intp_all.columns else np.zeros(len(intp_all)),
-        intp_all["start_area_id"].values if "start_area_id" in intp_all.columns else np.zeros(len(intp_all)),
-        intp_all["end_area_id"].values if "end_area_id" in intp_all.columns else np.zeros(len(intp_all)),
-        grid_id
-    ]).astype(np.int64)
-
-    # 타겟 (다음 스텝 예측)
-    Y = X_num.copy()
-
-    # 정규화 파라미터
-    x_mean = X_num.mean(axis=0, keepdims=True)
-    x_std = X_num.std(axis=0, keepdims=True) + 1e-6
-    y_mean = Y.mean(axis=0, keepdims=True)
-    y_std = Y.std(axis=0, keepdims=True) + 1e-6
-
-    # 정규화 적용
-    Xn_num = (X_num - x_mean) / x_std
-    Yn = (Y - y_mean) / y_std
-
-    del intp_all, X_num, Y  # 메모리 해제
-
-    # 시퀀스 인덱스 생성
-    print("\n[STEP 3] 시퀀스 인덱스 생성")
     segment_starts = []
-    for (s, e) in segment_bounds:
-        starts = []
-        max_start = e - 1 - seq_len
-        if max_start >= s:
-            for i in range(s, max_start + 1, stride):
-                starts.append(i)
-        segment_starts.append(starts)
+    current_offset = 0
+
+    all_Xn_num = []
+    all_X_cat = []
+    all_Yn = []
+    segment_bounds = []
+
+    # 파일별로 segment 정보 그룹화
+    file_to_segments = defaultdict(list)
+    for i, seg_info in enumerate(segment_info_list):
+        file_to_segments[seg_info['file_idx']].append((i, seg_info))
+
+    # 파일 단위로 처리 (같은 파일을 여러 번 읽지 않음)
+    processed_count = 0
+    for file_idx in sorted(file_to_segments.keys()):
+        if processed_count % 100 == 0:
+            print(f"  처리 중: {processed_count}/{len(segment_info_list)} segments")
+
+        file_info = file_list[file_idx]
+        segments = process_single_file(file_info, cog_mirror=cog_mirror)
+
+        for orig_idx, seg_info in file_to_segments[file_idx]:
+            seg_idx = seg_info['seg_idx']
+
+            if seg_idx >= len(segments):
+                continue
+
+            seg_df = segments[seg_idx]
+            n = len(seg_df)
+
+            if n < seq_len + 1:
+                continue
+
+            # 수치 데이터
+            x = np.column_stack([
+                seg_df["lat"].values,
+                seg_df["lon"].values,
+                seg_df["sog"].values,
+                seg_df["sin_cog"].values,
+                seg_df["cos_cog"].values,
+            ]).astype(np.float32)
+
+            # 정규화
+            xn = (x - x_mean) / x_std
+            yn = xn.copy()  # 타겟도 동일
+
+            # Categorical
+            mmsi_id = mmsi_vocab.get(seg_info['mmsi'], 0)
+            start_id = start_vocab.get(seg_info['start_area'], 0)
+            end_id = end_vocab.get(seg_info['end_area'], 0)
+
+            # 격자 ID (벡터화)
+            lat_arr = seg_df["lat"].values
+            lon_arr = seg_df["lon"].values
+            grid_rows = ((lat_arr - grid_info['lat_min']) / grid_info['grid_size']).astype(int)
+            grid_cols = ((lon_arr - grid_info['lon_min']) / grid_info['grid_size']).astype(int)
+            grid_ids = grid_rows * grid_info['num_cols'] + grid_cols
+            grid_ids = np.clip(grid_ids, 0, grid_info['total_grids'])
+
+            x_cat = np.column_stack([
+                np.full(n, mmsi_id),
+                np.full(n, start_id),
+                np.full(n, end_id),
+                grid_ids,
+            ]).astype(np.int64)
+
+            # 저장
+            all_Xn_num.append(xn)
+            all_X_cat.append(x_cat)
+            all_Yn.append(yn)
+
+            # segment 경계
+            start_idx = current_offset
+            end_idx = current_offset + n
+            segment_bounds.append((start_idx, end_idx))
+
+            # 시퀀스 시작 인덱스
+            starts = []
+            max_start = end_idx - 1 - seq_len
+            if max_start >= start_idx:
+                for i in range(start_idx, max_start + 1, stride):
+                    starts.append(i)
+            segment_starts.append(starts)
+
+            current_offset = end_idx
+            processed_count += 1
+
+        del segments
+        gc.collect()
+
+    print(f"[INFO] 처리된 segment 수: {len(segment_bounds)}")
+
+    # 병합
+    print("\n[STEP 4] 데이터 병합 및 저장")
+
+    Xn_num = np.vstack(all_Xn_num).astype(np.float32)
+    X_cat = np.vstack(all_X_cat).astype(np.int64)
+    Yn = np.vstack(all_Yn).astype(np.float32)
+
+    del all_Xn_num, all_X_cat, all_Yn
+    gc.collect()
 
     all_indices = [i for starts in segment_starts for i in starts]
+
+    print(f"[INFO] 최종 데이터 shape: Xn_num={Xn_num.shape}, X_cat={X_cat.shape}")
     print(f"[INFO] 총 시퀀스 수: {len(all_indices)}")
+
+    # 저장
+    data_path = os.path.join(args.output_dir, "training_data.npz")
+    np.savez_compressed(
+        data_path,
+        Xn_num=Xn_num,
+        X_cat=X_cat,
+        Yn=Yn,
+        segment_bounds=np.array(segment_bounds),
+        all_indices=np.array(all_indices),
+    )
+    print(f"[SAVED] 학습 데이터: {data_path}")
 
     # 메타 정보
     meta = {
@@ -411,99 +548,17 @@ def prepare_training_data(
         'lon_bounds': np.array(lon_bounds),
     }
 
-    return {
-        'Xn_num': Xn_num,
-        'X_cat': X_cat,
-        'Yn': Yn,
-        'segment_bounds': np.array(segment_bounds),
-        'segment_starts': segment_starts,
-        'all_indices': np.array(all_indices),
-        'meta': meta,
-    }
-
-
-def save_prepared_data(data, output_dir):
-    """전처리된 데이터를 npz 파일로 저장"""
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 데이터 파일
-    data_path = os.path.join(output_dir, "training_data.npz")
-    np.savez_compressed(
-        data_path,
-        Xn_num=data['Xn_num'],
-        X_cat=data['X_cat'],
-        Yn=data['Yn'],
-        segment_bounds=data['segment_bounds'],
-        all_indices=data['all_indices'],
-    )
-    print(f"[SAVED] 학습 데이터: {data_path}")
-
-    # 메타 정보 파일
-    meta_path = os.path.join(output_dir, "meta.npz")
-    np.savez(meta_path, **data['meta'])
+    meta_path = os.path.join(args.output_dir, "meta.npz")
+    np.savez(meta_path, **meta)
     print(f"[SAVED] 메타 정보: {meta_path}")
 
-    # segment_starts는 리스트의 리스트이므로 별도 저장
-    # pickle 대신 numpy object array 사용
-    seg_starts_path = os.path.join(output_dir, "segment_starts.npy")
-    np.save(seg_starts_path, np.array(data['segment_starts'], dtype=object), allow_pickle=True)
+    seg_starts_path = os.path.join(args.output_dir, "segment_starts.npy")
+    np.save(seg_starts_path, np.array(segment_starts, dtype=object), allow_pickle=True)
     print(f"[SAVED] Segment starts: {seg_starts_path}")
 
-    # 파일 크기 출력
+    # 파일 크기
     data_size = os.path.getsize(data_path) / (1024 * 1024)
     print(f"\n[INFO] 데이터 파일 크기: {data_size:.1f} MB")
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="학습 데이터 전처리 및 저장",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-
-    parser.add_argument("--data_folder", type=str, required=True,
-                        help="항적 CSV 파일이 저장된 폴더")
-    parser.add_argument("--transition_folder", type=str, required=True,
-                        help="전이 정보 CSV 파일이 저장된 폴더")
-    parser.add_argument("--output_dir", type=str, default="prepared_data",
-                        help="전처리된 데이터 저장 폴더 (기본값: prepared_data)")
-    parser.add_argument("--seq_len", type=int, default=50,
-                        help="시퀀스 길이 (기본값: 50)")
-    parser.add_argument("--stride", type=int, default=3,
-                        help="슬라이딩 윈도우 이동 간격 (기본값: 3)")
-    parser.add_argument("--grid_size", type=float, default=0.05,
-                        help="격자 크기 (도 단위, 기본값: 0.05)")
-
-    args = parser.parse_args()
-
-    print("=" * 60)
-    print("학습 데이터 전처리")
-    print("=" * 60)
-    print(f"데이터 폴더: {args.data_folder}")
-    print(f"전이 정보 폴더: {args.transition_folder}")
-    print(f"출력 폴더: {args.output_dir}")
-    print(f"시퀀스 길이: {args.seq_len}")
-    print(f"Stride: {args.stride}")
-    print(f"격자 크기: {args.grid_size}도")
-    print("=" * 60)
-
-    # 1. 전이 정보 로드
-    print("\n[STEP 0] 데이터 로드")
-    transition_df = load_transition_data(args.transition_folder)
-
-    # 2. 항적 데이터 로드
-    trajectory_df = load_trajectory_data(transition_df, args.data_folder)
-
-    # 3. 전처리
-    data = prepare_training_data(
-        trajectory_df,
-        seq_len=args.seq_len,
-        stride=args.stride,
-        grid_size=args.grid_size,
-    )
-
-    # 4. 저장
-    print("\n[STEP 4] 데이터 저장")
-    save_prepared_data(data, args.output_dir)
 
     print("\n" + "=" * 60)
     print("전처리 완료!")
