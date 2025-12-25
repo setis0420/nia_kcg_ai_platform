@@ -11,7 +11,7 @@ set PYTHON_EXE=C:\Users\user\anaconda3\envs\kki_gpu2\python.exe
 REM Data settings
 set DATA_FOLDER=G:/NIA_ai_project/항적데이터 추출/여수
 set TRANSITION_FOLDER=area_transition_results
-set OUTPUT_DIR=prepared_data
+set OUTPUT_DIR=prepared_data/yeosu_50
 
 REM Preprocessing parameters
 set SEQ_LEN=50

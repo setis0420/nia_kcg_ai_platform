@@ -27,7 +27,7 @@ SAVE_DIR = "global_model_v2"
 
 class TrajectoryDatasetFromNpz(Dataset):
     """
-    전처리된 npz 데이터를 로드하여 사용하는 Dataset
+    전처리된 npz 데이터를 로드하여 사용하는 Dataset (CPU용)
     """
     def __init__(self, Xn_num, X_cat, Yn, indices, seq_len):
         self.Xn_num = Xn_num
@@ -52,6 +52,129 @@ class TrajectoryDatasetFromNpz(Dataset):
                 torch.from_numpy(x_cat),
                 torch.from_numpy(y),
                 torch.from_numpy(x_last))
+
+
+class TrajectoryDatasetGPU(Dataset):
+    """
+    GPU에 미리 올려둔 텐서를 사용하는 Dataset (빠른 학습용)
+    시퀀스를 미리 구성하여 GPU에서 바로 사용
+    """
+    def __init__(self, Xn_num_t, X_cat_t, Yn_t, indices, seq_len, device):
+        # 미리 모든 시퀀스를 구성 (GPU에서 직접 수행)
+        n_samples = len(indices)
+        indices_t = torch.tensor(indices, dtype=torch.long, device=device)
+
+        # 시퀀스 인덱스 생성: [n_samples, seq_len]
+        seq_offsets = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
+        all_indices = indices_t.unsqueeze(1) + seq_offsets  # [n_samples, seq_len]
+
+        # 미리 시퀀스 데이터 구성
+        self.X_num = Xn_num_t[all_indices]  # [n_samples, seq_len, num_features]
+        self.X_cat = X_cat_t[all_indices]   # [n_samples, seq_len, cat_features]
+        self.Y = Yn_t[indices_t + seq_len]  # [n_samples, output_dim]
+        self.X_last = Xn_num_t[indices_t + seq_len - 1]  # [n_samples, num_features]
+
+        self.n_samples = n_samples
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, idx):
+        return self.X_num[idx], self.X_cat[idx], self.Y[idx], self.X_last[idx]
+
+
+class ChunkedTrainer:
+    """
+    큰 데이터셋을 청크 단위로 GPU에 올려서 학습
+    메모리 효율적 + GPU compute 활용
+    """
+    def __init__(self, Xn_num, X_cat, Yn, segment_starts, seq_len,
+                 train_seg_ids, val_seg_ids, device, chunk_size=50):
+        """
+        chunk_size: 한 번에 GPU에 올릴 segment 개수
+        """
+        self.Xn_num = Xn_num  # numpy array (CPU)
+        self.X_cat = X_cat
+        self.Yn = Yn
+        self.segment_starts = segment_starts
+        self.seq_len = seq_len
+        self.train_seg_ids = train_seg_ids
+        self.val_seg_ids = val_seg_ids
+        self.device = device
+        self.chunk_size = chunk_size
+
+    def _get_segment_data_range(self, seg_ids):
+        """segment들의 데이터 범위 계산"""
+        if len(seg_ids) == 0:
+            return None, None, []
+
+        all_indices = []
+        for sid in seg_ids:
+            all_indices.extend(self.segment_starts[sid])
+
+        if len(all_indices) == 0:
+            return None, None, []
+
+        # 필요한 데이터 범위 계산
+        min_idx = min(all_indices)
+        max_idx = max(all_indices) + self.seq_len + 1
+
+        return min_idx, max_idx, all_indices
+
+    def _load_chunk_to_gpu(self, seg_ids):
+        """특정 segment들의 데이터를 GPU에 로드"""
+        min_idx, max_idx, indices = self._get_segment_data_range(seg_ids)
+
+        if min_idx is None:
+            return None, None, None, []
+
+        # 해당 범위만 GPU에 올림 (float32로 변환하여 GPU 효율성 향상)
+        Xn_chunk = torch.from_numpy(self.Xn_num[min_idx:max_idx].astype(np.float32)).to(self.device)
+        Xcat_chunk = torch.from_numpy(self.X_cat[min_idx:max_idx]).to(self.device)  # int는 그대로
+        Yn_chunk = torch.from_numpy(self.Yn[min_idx:max_idx].astype(np.float32)).to(self.device)
+
+        # 인덱스 조정 (청크 내 상대 인덱스로 변환)
+        adjusted_indices = [i - min_idx for i in indices]
+
+        return Xn_chunk, Xcat_chunk, Yn_chunk, adjusted_indices
+
+    def get_train_chunks(self):
+        """학습용 청크 생성기"""
+        # 매 epoch마다 segment 순서 섞기
+        shuffled_ids = self.train_seg_ids.copy()
+        np.random.shuffle(shuffled_ids)
+
+        for i in range(0, len(shuffled_ids), self.chunk_size):
+            chunk_seg_ids = shuffled_ids[i:i + self.chunk_size]
+            yield self._load_chunk_to_gpu(chunk_seg_ids)
+
+    def get_val_chunks(self):
+        """검증용 청크 생성기"""
+        for i in range(0, len(self.val_seg_ids), self.chunk_size):
+            chunk_seg_ids = self.val_seg_ids[i:i + self.chunk_size]
+            yield self._load_chunk_to_gpu(chunk_seg_ids)
+
+    @property
+    def n_train_chunks(self):
+        return (len(self.train_seg_ids) + self.chunk_size - 1) // self.chunk_size
+
+    @property
+    def n_val_chunks(self):
+        return (len(self.val_seg_ids) + self.chunk_size - 1) // self.chunk_size
+
+    @property
+    def n_train_sequences(self):
+        total = 0
+        for sid in self.train_seg_ids:
+            total += len(self.segment_starts[sid])
+        return total
+
+    @property
+    def n_val_sequences(self):
+        total = 0
+        for sid in self.val_seg_ids:
+            total += len(self.segment_starts[sid])
+        return total
 
 
 class LSTMTrajectoryModelV2(nn.Module):
@@ -178,6 +301,7 @@ def train_model(
     grad_clip_norm=1.0,
     val_ratio=0.2,
     seed=42,
+    chunk_size=100,  # 한 번에 GPU에 올릴 segment 수
 ):
     """모델 학습"""
     if device is None:
@@ -219,15 +343,16 @@ def train_model(
         val_indices.extend(segment_starts[sid])
     val_indices = np.array(val_indices)
 
-    print(f"  - train segments: {len(train_seg_ids)}, sequences: {len(train_indices)}")
-    print(f"  - val segments: {len(val_seg_ids)}, sequences: {len(val_indices)}")
+    # ChunkedTrainer 생성 (데이터를 청크 단위로 GPU에 올림)
+    chunked_trainer = ChunkedTrainer(
+        Xn_num, X_cat, Yn, segment_starts, seq_len,
+        train_seg_ids, val_seg_ids, device, chunk_size=chunk_size
+    )
 
-    # Dataset & DataLoader
-    train_ds = TrajectoryDatasetFromNpz(Xn_num, X_cat, Yn, train_indices, seq_len)
-    val_ds = TrajectoryDatasetFromNpz(Xn_num, X_cat, Yn, val_indices, seq_len)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    print(f"  - train segments: {len(train_seg_ids)}, sequences: {chunked_trainer.n_train_sequences}")
+    print(f"  - val segments: {len(val_seg_ids)}, sequences: {chunked_trainer.n_val_sequences}")
+    print(f"  - chunk_size: {chunk_size} segments/chunk")
+    print(f"  - train chunks: {chunked_trainer.n_train_chunks}, val chunks: {chunked_trainer.n_val_chunks}")
 
     # 모델 생성
     model = LSTMTrajectoryModelV2(
@@ -266,41 +391,39 @@ def train_model(
 
     print(f"\n[INFO] 학습 시작 | epochs={epochs}, warmup={warmup_epochs}, patience={patience}")
 
+    n_train_chunks = chunked_trainer.n_train_chunks
+    n_val_chunks = chunked_trainer.n_val_chunks
+
     for epoch in range(1, epochs + 1):
         # Train
         model.train()
-        tr_loss = 0.0
-        for x_num, x_cat, y, x_last in train_loader:
-            x_num, x_cat = x_num.to(device), x_cat.to(device)
-            y, x_last = y.to(device), x_last.to(device)
+        tr_loss_sum = 0.0
+        tr_count = 0
 
-            optimizer.zero_grad()
-            y_pred = model(x_num, x_cat)
-            loss = loss_with_smoothness(
-                y_pred, y, x_last,
-                smooth_lambda=smooth_lambda,
-                sog_lambda=sog_lambda,
-                heading_lambda=heading_lambda,
-                turn_boost=turn_boost,
-            )
-            loss.backward()
+        for chunk_idx, (Xn_chunk, Xcat_chunk, Yn_chunk, indices) in enumerate(chunked_trainer.get_train_chunks()):
+            if Xn_chunk is None:
+                continue
 
-            if grad_clip_norm and grad_clip_norm > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            # 청크 내 데이터를 GPU에서 직접 시퀀스로 구성
+            chunk_ds = TrajectoryDatasetGPU(Xn_chunk, Xcat_chunk, Yn_chunk, indices, seq_len, device)
+            n_samples = len(chunk_ds)
 
-            optimizer.step()
-            tr_loss += loss.item() * x_num.size(0)
+            # 배치 인덱스 셔플 (GPU에서)
+            perm = torch.randperm(n_samples, device=device)
 
-        tr_loss /= max(1, len(train_loader.dataset))
+            # 청크 내 loss 누적 (GPU에서)
+            chunk_loss = torch.tensor(0.0, device=device)
+            chunk_count = 0
 
-        # Validation
-        model.eval()
-        va_loss = 0.0
-        with torch.inference_mode():
-            for x_num, x_cat, y, x_last in val_loader:
-                x_num, x_cat = x_num.to(device), x_cat.to(device)
-                y, x_last = y.to(device), x_last.to(device)
+            # DataLoader 없이 직접 배치 처리 (GPU 텐서 그대로 사용)
+            for start in range(0, n_samples, batch_size):
+                batch_idx = perm[start:start + batch_size]
+                x_num = chunk_ds.X_num[batch_idx]
+                x_cat = chunk_ds.X_cat[batch_idx]
+                y = chunk_ds.Y[batch_idx]
+                x_last = chunk_ds.X_last[batch_idx]
 
+                optimizer.zero_grad()
                 y_pred = model(x_num, x_cat)
                 loss = loss_with_smoothness(
                     y_pred, y, x_last,
@@ -309,8 +432,84 @@ def train_model(
                     heading_lambda=heading_lambda,
                     turn_boost=turn_boost,
                 )
-                va_loss += loss.item() * x_num.size(0)
-        va_loss /= max(1, len(val_loader.dataset))
+                loss.backward()
+
+                if grad_clip_norm and grad_clip_norm > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+
+                optimizer.step()
+
+                # GPU에서 누적 (동기화 없음)
+                chunk_loss += loss.detach() * x_num.size(0)
+                chunk_count += x_num.size(0)
+
+            # 청크 끝에서만 CPU로 가져옴
+            tr_loss_sum += chunk_loss.item()
+            tr_count += chunk_count
+
+            # 청크 메모리 해제
+            del Xn_chunk, Xcat_chunk, Yn_chunk, chunk_ds, chunk_loss
+            if device == "cuda":
+                torch.cuda.empty_cache()
+
+            # 진행률 표시
+            progress = (chunk_idx + 1) / n_train_chunks * 100
+            print(f"\r  [Epoch {epoch:03d}/{epochs}] Train: chunk {chunk_idx+1}/{n_train_chunks} ({progress:.0f}%)", end="", flush=True)
+
+        tr_loss = tr_loss_sum / max(1, tr_count)
+        print()  # 줄바꿈
+
+        # Validation
+        model.eval()
+        va_loss_sum = 0.0
+        va_count = 0
+
+        with torch.inference_mode():
+            for chunk_idx, (Xn_chunk, Xcat_chunk, Yn_chunk, indices) in enumerate(chunked_trainer.get_val_chunks()):
+                if Xn_chunk is None:
+                    continue
+
+                chunk_ds = TrajectoryDatasetGPU(Xn_chunk, Xcat_chunk, Yn_chunk, indices, seq_len, device)
+                n_samples = len(chunk_ds)
+
+                # 청크 내 loss 누적 (GPU에서)
+                chunk_loss = torch.tensor(0.0, device=device)
+                chunk_count = 0
+
+                # DataLoader 없이 직접 배치 처리
+                for start in range(0, n_samples, batch_size):
+                    end = min(start + batch_size, n_samples)
+                    x_num = chunk_ds.X_num[start:end]
+                    x_cat = chunk_ds.X_cat[start:end]
+                    y = chunk_ds.Y[start:end]
+                    x_last = chunk_ds.X_last[start:end]
+
+                    y_pred = model(x_num, x_cat)
+                    loss = loss_with_smoothness(
+                        y_pred, y, x_last,
+                        smooth_lambda=smooth_lambda,
+                        sog_lambda=sog_lambda,
+                        heading_lambda=heading_lambda,
+                        turn_boost=turn_boost,
+                    )
+                    chunk_loss += loss * x_num.size(0)
+                    chunk_count += x_num.size(0)
+
+                # 청크 끝에서만 CPU로 가져옴
+                va_loss_sum += chunk_loss.item()
+                va_count += chunk_count
+
+                # 청크 메모리 해제
+                del Xn_chunk, Xcat_chunk, Yn_chunk, chunk_ds, chunk_loss
+                if device == "cuda":
+                    torch.cuda.empty_cache()
+
+                # 진행률 표시
+                progress = (chunk_idx + 1) / n_val_chunks * 100
+                print(f"\r  [Epoch {epoch:03d}/{epochs}] Val: chunk {chunk_idx+1}/{n_val_chunks} ({progress:.0f}%)", end="", flush=True)
+
+        va_loss = va_loss_sum / max(1, va_count)
+        print()  # 줄바꿈
 
         cur_lr = optimizer.param_groups[0]["lr"]
 
@@ -393,7 +592,7 @@ def train_model(
     print(f"  - {model_path}")
     print(f"  - {scaler_path}")
 
-    del model, optimizer, train_loader, val_loader
+    del model, optimizer
     gc.collect()
 
     return model_path, scaler_path
@@ -432,6 +631,8 @@ def main():
                         help="학습 장치 (기본값: cuda)")
     parser.add_argument("--save_dir", type=str, default="global_model_v2",
                         help="모델 저장 폴더 (기본값: global_model_v2)")
+    parser.add_argument("--chunk_size", type=int, default=100,
+                        help="한 번에 GPU에 올릴 segment 수 (기본값: 100)")
 
     args = parser.parse_args()
 
@@ -442,6 +643,13 @@ def main():
     print(f"저장 폴더: {args.save_dir}")
     print(f"장치: {args.device}")
     print(f"Epochs: {args.epochs}")
+
+    # CUDA 확인
+    print(f"\n[PyTorch] version: {torch.__version__}")
+    print(f"[CUDA] available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"[CUDA] device: {torch.cuda.get_device_name(0)}")
+        print(f"[CUDA] memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
     print("=" * 60)
 
     model_path, scaler_path = train_model(
@@ -458,6 +666,7 @@ def main():
         turn_boost=args.turn_boost,
         embed_dim=args.embed_dim,
         val_ratio=args.val_ratio,
+        chunk_size=args.chunk_size,
     )
 
     print("\n" + "=" * 60)

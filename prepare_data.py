@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-학습 데이터 전처리 및 저장 (메모리 효율 버전)
-=============================================
-파일을 하나씩 처리하여 메모리 사용량 최소화
+학습 데이터 전처리 및 저장 (Multiprocessing 버전)
+================================================
+멀티프로세싱을 사용하여 병렬 처리
 
 사용법:
     python prepare_data.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \
                            --transition_folder "area_transition_results" \
                            --output_dir "prepared_data" \
-                           --seq_len 50 --stride 3
+                           --seq_len 50 --stride 3 --num_workers 4
 """
 
 import os
 import gc
 import argparse
 from collections import defaultdict
+from multiprocessing import Pool, cpu_count
+from functools import partial
 import numpy as np
 import pandas as pd
 import warnings
@@ -186,8 +188,11 @@ def get_file_list(transition_df, data_folder):
     return file_list
 
 
-def process_single_file(file_info, cog_mirror=True):
-    """단일 파일 처리 (보간)"""
+def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
+    """
+    단일 파일 처리 - 통계 수집용 (Pass 1)
+    Returns: dict with stats or None
+    """
     try:
         trj = pd.read_csv(file_info['filepath'], encoding='cp949')
         trj = trj.loc[:, ~trj.columns.str.contains('^Unnamed')]
@@ -197,7 +202,101 @@ def process_single_file(file_info, cog_mirror=True):
         trj['start_area'] = parsed_start if parsed_start else file_info['start_area']
         trj['end_area'] = parsed_end if parsed_end else file_info['end_area']
 
-        # datetime 변환
+        trj["datetime"] = pd.to_datetime(trj["datetime"], errors="coerce")
+        for c in ["lat", "lon", "sog", "cog", "mmsi"]:
+            if c in trj.columns:
+                trj[c] = pd.to_numeric(trj[c], errors="coerce")
+        trj = trj.dropna(subset=["datetime", "lat", "lon", "sog", "cog"])
+
+        if trj.empty:
+            return None
+
+        segments = split_by_gap(trj, max_gap_days=1)
+
+        result = {
+            'file_idx': file_info['fid'],
+            'n_total': 0,
+            'sum_x': np.zeros(5, dtype=np.float64),
+            'sum_x2': np.zeros(5, dtype=np.float64),
+            'lat_min': float('inf'),
+            'lat_max': float('-inf'),
+            'lon_min': float('inf'),
+            'lon_max': float('-inf'),
+            'mmsi_set': set(),
+            'start_area_set': set(),
+            'end_area_set': set(),
+            'segment_infos': [],
+        }
+
+        for seg_idx, seg_df in enumerate(segments):
+            intp_df = data_intp(seg_df)
+            if intp_df is None or len(intp_df) == 0:
+                continue
+
+            intp_df = intp_df.sort_values("datetime").reset_index(drop=True)
+            n = len(intp_df)
+
+            if n < seq_len + 1:
+                continue
+
+            sin_cog = np.sin(np.radians(intp_df["cog"].values))
+            cos_cog = np.cos(np.radians(intp_df["cog"].values))
+            if cog_mirror:
+                sin_cog = -sin_cog
+
+            x = np.column_stack([
+                intp_df["lat"].values,
+                intp_df["lon"].values,
+                intp_df["sog"].values,
+                sin_cog,
+                cos_cog,
+            ]).astype(np.float64)
+
+            result['n_total'] += n
+            result['sum_x'] += x.sum(axis=0)
+            result['sum_x2'] += (x ** 2).sum(axis=0)
+
+            result['lat_min'] = min(result['lat_min'], intp_df["lat"].min())
+            result['lat_max'] = max(result['lat_max'], intp_df["lat"].max())
+            result['lon_min'] = min(result['lon_min'], intp_df["lon"].min())
+            result['lon_max'] = max(result['lon_max'], intp_df["lon"].max())
+
+            result['mmsi_set'].add(file_info['mmsi'])
+            result['start_area_set'].add(intp_df["start_area"].iloc[0])
+            result['end_area_set'].add(intp_df["end_area"].iloc[0])
+
+            result['segment_infos'].append({
+                'file_idx': file_info['fid'],
+                'seg_idx': seg_idx,
+                'length': n,
+                'fid': file_info['fid'],
+                'mmsi': file_info['mmsi'],
+                'start_area': intp_df["start_area"].iloc[0],
+                'end_area': intp_df["end_area"].iloc[0],
+            })
+
+        return result if result['n_total'] > 0 else None
+
+    except Exception as e:
+        return None
+
+
+def process_single_file_for_data(args):
+    """
+    단일 파일 처리 - 데이터 생성용 (Pass 2)
+    """
+    file_info, seg_infos, seq_len, stride, cog_mirror, x_mean, x_std, \
+        mmsi_vocab, start_vocab, end_vocab, grid_info = args
+
+    try:
+        trj = pd.read_csv(file_info['filepath'], encoding='cp949')
+        trj = trj.loc[:, ~trj.columns.str.contains('^Unnamed')]
+        trj['fid'] = file_info['fid']
+
+        parsed_mmsi, parsed_start, parsed_end = parse_filename(file_info['filename'])
+        trj['start_area'] = parsed_start if parsed_start else file_info['start_area']
+        trj['end_area'] = parsed_end if parsed_end else file_info['end_area']
+
         trj["datetime"] = pd.to_datetime(trj["datetime"], errors="coerce")
         for c in ["lat", "lon", "sog", "cog", "mmsi"]:
             if c in trj.columns:
@@ -207,16 +306,14 @@ def process_single_file(file_info, cog_mirror=True):
         if trj.empty:
             return []
 
-        # 시간 간격으로 segment 분리 및 보간
-        segments = split_by_gap(trj, max_gap_days=1)
+        segments_raw = split_by_gap(trj, max_gap_days=1)
 
-        results = []
-        for seg_df in segments:
+        segments = []
+        for seg_df in segments_raw:
             intp_df = data_intp(seg_df)
             if intp_df is not None and len(intp_df) > 0:
                 intp_df = intp_df.sort_values("datetime").reset_index(drop=True)
 
-                # sin/cos 계산
                 sin_cog = np.sin(np.radians(intp_df["cog"].values))
                 cos_cog = np.cos(np.radians(intp_df["cog"].values))
                 if cog_mirror:
@@ -224,19 +321,68 @@ def process_single_file(file_info, cog_mirror=True):
 
                 intp_df["sin_cog"] = sin_cog
                 intp_df["cos_cog"] = cos_cog
+                segments.append(intp_df)
 
-                results.append(intp_df)
+        results = []
+
+        for seg_info in seg_infos:
+            seg_idx = seg_info['seg_idx']
+
+            if seg_idx >= len(segments):
+                continue
+
+            seg_df = segments[seg_idx]
+            n = len(seg_df)
+
+            if n < seq_len + 1:
+                continue
+
+            x = np.column_stack([
+                seg_df["lat"].values,
+                seg_df["lon"].values,
+                seg_df["sog"].values,
+                seg_df["sin_cog"].values,
+                seg_df["cos_cog"].values,
+            ]).astype(np.float32)
+
+            xn = (x - x_mean) / x_std
+            yn = xn.copy()
+
+            mmsi_id = mmsi_vocab.get(seg_info['mmsi'], 0)
+            start_id = start_vocab.get(seg_info['start_area'], 0)
+            end_id = end_vocab.get(seg_info['end_area'], 0)
+
+            lat_arr = seg_df["lat"].values
+            lon_arr = seg_df["lon"].values
+            grid_rows = ((lat_arr - grid_info['lat_min']) / grid_info['grid_size']).astype(int)
+            grid_cols = ((lon_arr - grid_info['lon_min']) / grid_info['grid_size']).astype(int)
+            grid_ids = grid_rows * grid_info['num_cols'] + grid_cols
+            grid_ids = np.clip(grid_ids, 0, grid_info['total_grids'])
+
+            x_cat = np.column_stack([
+                np.full(n, mmsi_id),
+                np.full(n, start_id),
+                np.full(n, end_id),
+                grid_ids,
+            ]).astype(np.int64)
+
+            results.append({
+                'xn': xn,
+                'x_cat': x_cat,
+                'yn': yn,
+                'length': n,
+                'seg_info': seg_info,
+            })
 
         return results
 
     except Exception as e:
-        print(f"[WARN] 파일 처리 실패: {file_info['filepath']}, {e}")
         return []
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="학습 데이터 전처리 및 저장 (메모리 효율 버전)",
+        description="학습 데이터 전처리 및 저장 (Multiprocessing 버전)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
@@ -252,16 +398,19 @@ def main():
                         help="슬라이딩 윈도우 이동 간격 (기본값: 3)")
     parser.add_argument("--grid_size", type=float, default=0.05,
                         help="격자 크기 (도 단위, 기본값: 0.05)")
+    parser.add_argument("--num_workers", type=int, default=4,
+                        help="병렬 처리 워커 수 (기본값: 4)")
 
     args = parser.parse_args()
 
     seq_len = args.seq_len
     stride = args.stride
     grid_size = args.grid_size
+    num_workers = min(args.num_workers, cpu_count())
     cog_mirror = True
 
     print("=" * 60)
-    print("학습 데이터 전처리 (메모리 효율 버전)")
+    print("학습 데이터 전처리 (Multiprocessing 버전)")
     print("=" * 60)
     print(f"데이터 폴더: {args.data_folder}")
     print(f"전이 정보 폴더: {args.transition_folder}")
@@ -269,12 +418,10 @@ def main():
     print(f"시퀀스 길이: {seq_len}")
     print(f"Stride: {stride}")
     print(f"격자 크기: {grid_size}도")
+    print(f"워커 수: {num_workers}")
     print("=" * 60)
 
-    # 출력 폴더 생성
     os.makedirs(args.output_dir, exist_ok=True)
-    segments_dir = os.path.join(args.output_dir, "segments")
-    os.makedirs(segments_dir, exist_ok=True)
 
     # 1. 전이 정보 로드
     print("\n[STEP 1] 파일 목록 생성")
@@ -283,73 +430,43 @@ def main():
     print(f"[INFO] 유효한 파일 수: {len(file_list)}")
 
     # ==============================================
-    # PASS 1: 통계 수집 (파일 하나씩 처리)
+    # PASS 1: 통계 수집 (멀티프로세싱)
     # ==============================================
-    print("\n[STEP 2] 통계 수집 (Pass 1)")
+    print(f"\n[STEP 2] 통계 수집 (Pass 1) - {num_workers} workers")
 
-    # 온라인 통계 계산을 위한 변수
+    process_func = partial(process_single_file_for_stats, seq_len=seq_len, cog_mirror=cog_mirror)
+
+    with Pool(num_workers) as pool:
+        results = list(pool.imap(process_func, file_list, chunksize=10))
+
+    # 결과 병합
     n_total = 0
-    sum_x = np.zeros(5, dtype=np.float64)  # lat, lon, sog, sin_cog, cos_cog
+    sum_x = np.zeros(5, dtype=np.float64)
     sum_x2 = np.zeros(5, dtype=np.float64)
-
     lat_min, lat_max = float('inf'), float('-inf')
     lon_min, lon_max = float('inf'), float('-inf')
-
     mmsi_set = set()
     start_area_set = set()
     end_area_set = set()
+    segment_info_list = []
 
-    segment_info_list = []  # (file_idx, seg_idx, length, fid, mmsi, start_area, end_area)
+    for r in results:
+        if r is None:
+            continue
+        n_total += r['n_total']
+        sum_x += r['sum_x']
+        sum_x2 += r['sum_x2']
+        lat_min = min(lat_min, r['lat_min'])
+        lat_max = max(lat_max, r['lat_max'])
+        lon_min = min(lon_min, r['lon_min'])
+        lon_max = max(lon_max, r['lon_max'])
+        mmsi_set.update(r['mmsi_set'])
+        start_area_set.update(r['start_area_set'])
+        end_area_set.update(r['end_area_set'])
+        segment_info_list.extend(r['segment_infos'])
 
-    for file_idx, file_info in enumerate(file_list):
-        if file_idx % 100 == 0:
-            print(f"  처리 중: {file_idx}/{len(file_list)}")
-
-        segments = process_single_file(file_info, cog_mirror=cog_mirror)
-
-        for seg_idx, seg_df in enumerate(segments):
-            n = len(seg_df)
-            if n < seq_len + 1:
-                continue
-
-            # 수치 데이터
-            x = np.column_stack([
-                seg_df["lat"].values,
-                seg_df["lon"].values,
-                seg_df["sog"].values,
-                seg_df["sin_cog"].values,
-                seg_df["cos_cog"].values,
-            ]).astype(np.float64)
-
-            # 온라인 통계 업데이트
-            n_total += n
-            sum_x += x.sum(axis=0)
-            sum_x2 += (x ** 2).sum(axis=0)
-
-            # 범위 업데이트
-            lat_min = min(lat_min, seg_df["lat"].min())
-            lat_max = max(lat_max, seg_df["lat"].max())
-            lon_min = min(lon_min, seg_df["lon"].min())
-            lon_max = max(lon_max, seg_df["lon"].max())
-
-            # Categorical 수집
-            mmsi_set.add(file_info['mmsi'])
-            start_area_set.add(seg_df["start_area"].iloc[0])
-            end_area_set.add(seg_df["end_area"].iloc[0])
-
-            # segment 정보 저장
-            segment_info_list.append({
-                'file_idx': file_idx,
-                'seg_idx': seg_idx,
-                'length': n,
-                'fid': file_info['fid'],
-                'mmsi': file_info['mmsi'],
-                'start_area': seg_df["start_area"].iloc[0],
-                'end_area': seg_df["end_area"].iloc[0],
-            })
-
-        del segments
-        gc.collect()
+    del results
+    gc.collect()
 
     print(f"[INFO] 유효 segment 수: {len(segment_info_list)}")
     print(f"[INFO] 총 데이터 포인트: {n_total}")
@@ -362,7 +479,6 @@ def main():
     x_var = (sum_x2 / n_total) - (sum_x / n_total) ** 2
     x_std = (np.sqrt(np.maximum(x_var, 1e-12)) + 1e-6).astype(np.float32).reshape(1, -1)
 
-    # y도 동일 (다음 스텝 예측)
     y_mean = x_mean.copy()
     y_std = x_std.copy()
 
@@ -394,88 +510,52 @@ def main():
     print(f"[INFO] End Area: {len(end_vocab)} 종류")
 
     # ==============================================
-    # PASS 2: 정규화 및 저장 (파일 단위로 처리)
+    # PASS 2: 정규화 및 저장 (멀티프로세싱)
     # ==============================================
-    print("\n[STEP 3] 정규화 및 저장 (Pass 2)")
+    print(f"\n[STEP 3] 정규화 및 저장 (Pass 2) - {num_workers} workers")
 
-    segment_starts = []
-    current_offset = 0
+    # 파일별로 segment 정보 그룹화
+    file_to_segments = defaultdict(list)
+    for seg_info in segment_info_list:
+        file_to_segments[seg_info['file_idx']].append(seg_info)
 
+    # 작업 목록 생성
+    tasks = []
+    for file_info in file_list:
+        if file_info['fid'] in file_to_segments:
+            seg_infos = file_to_segments[file_info['fid']]
+            tasks.append((
+                file_info, seg_infos, seq_len, stride, cog_mirror,
+                x_mean, x_std, mmsi_vocab, start_vocab, end_vocab, grid_info
+            ))
+
+    # 병렬 처리
+    with Pool(num_workers) as pool:
+        results = list(pool.imap(process_single_file_for_data, tasks, chunksize=10))
+
+    # 결과 병합
     all_Xn_num = []
     all_X_cat = []
     all_Yn = []
     segment_bounds = []
+    segment_starts = []
+    current_offset = 0
 
-    # 파일별로 segment 정보 그룹화
-    file_to_segments = defaultdict(list)
-    for i, seg_info in enumerate(segment_info_list):
-        file_to_segments[seg_info['file_idx']].append((i, seg_info))
+    for file_results in results:
+        for r in file_results:
+            xn = r['xn']
+            x_cat = r['x_cat']
+            yn = r['yn']
+            n = r['length']
 
-    # 파일 단위로 처리 (같은 파일을 여러 번 읽지 않음)
-    processed_count = 0
-    for file_idx in sorted(file_to_segments.keys()):
-        if processed_count % 100 == 0:
-            print(f"  처리 중: {processed_count}/{len(segment_info_list)} segments")
-
-        file_info = file_list[file_idx]
-        segments = process_single_file(file_info, cog_mirror=cog_mirror)
-
-        for orig_idx, seg_info in file_to_segments[file_idx]:
-            seg_idx = seg_info['seg_idx']
-
-            if seg_idx >= len(segments):
-                continue
-
-            seg_df = segments[seg_idx]
-            n = len(seg_df)
-
-            if n < seq_len + 1:
-                continue
-
-            # 수치 데이터
-            x = np.column_stack([
-                seg_df["lat"].values,
-                seg_df["lon"].values,
-                seg_df["sog"].values,
-                seg_df["sin_cog"].values,
-                seg_df["cos_cog"].values,
-            ]).astype(np.float32)
-
-            # 정규화
-            xn = (x - x_mean) / x_std
-            yn = xn.copy()  # 타겟도 동일
-
-            # Categorical
-            mmsi_id = mmsi_vocab.get(seg_info['mmsi'], 0)
-            start_id = start_vocab.get(seg_info['start_area'], 0)
-            end_id = end_vocab.get(seg_info['end_area'], 0)
-
-            # 격자 ID (벡터화)
-            lat_arr = seg_df["lat"].values
-            lon_arr = seg_df["lon"].values
-            grid_rows = ((lat_arr - grid_info['lat_min']) / grid_info['grid_size']).astype(int)
-            grid_cols = ((lon_arr - grid_info['lon_min']) / grid_info['grid_size']).astype(int)
-            grid_ids = grid_rows * grid_info['num_cols'] + grid_cols
-            grid_ids = np.clip(grid_ids, 0, grid_info['total_grids'])
-
-            x_cat = np.column_stack([
-                np.full(n, mmsi_id),
-                np.full(n, start_id),
-                np.full(n, end_id),
-                grid_ids,
-            ]).astype(np.int64)
-
-            # 저장
             all_Xn_num.append(xn)
             all_X_cat.append(x_cat)
             all_Yn.append(yn)
 
-            # segment 경계
             start_idx = current_offset
             end_idx = current_offset + n
             segment_bounds.append((start_idx, end_idx))
 
-            # 시퀀스 시작 인덱스
             starts = []
             max_start = end_idx - 1 - seq_len
             if max_start >= start_idx:
@@ -484,10 +564,9 @@ def main():
             segment_starts.append(starts)
 
             current_offset = end_idx
-            processed_count += 1
 
-        del segments
-        gc.collect()
+    del results
+    gc.collect()
 
     print(f"[INFO] 처리된 segment 수: {len(segment_bounds)}")
 

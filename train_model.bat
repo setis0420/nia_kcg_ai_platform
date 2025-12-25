@@ -27,6 +27,9 @@ set DEVICE=cuda
 REM Embedding settings
 set EMBED_DIM=16
 
+REM Memory settings
+set CHUNK_SIZE=100
+
 echo.
 echo [Settings]
 echo Python: %PYTHON_EXE%
@@ -36,6 +39,7 @@ echo Device: %DEVICE%
 echo Epochs: %EPOCHS%
 echo Batch Size: %BATCH_SIZE%
 echo Embed Dim: %EMBED_DIM%
+echo Chunk Size: %CHUNK_SIZE%
 echo ============================================================
 echo.
 
@@ -52,7 +56,8 @@ echo.
     --val_ratio %VAL_RATIO% ^
     --device %DEVICE% ^
     --save_dir %SAVE_DIR% ^
-    --embed_dim %EMBED_DIM%
+    --embed_dim %EMBED_DIM% ^
+    --chunk_size %CHUNK_SIZE%
 
 echo.
 echo ============================================================
