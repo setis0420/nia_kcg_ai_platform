@@ -42,13 +42,14 @@ echo [STEP 1/2] 데이터 전처리 완료!
 echo.
 
 REM ============================================================
-REM STEP 2: 모델 학습
+REM STEP 2: 모델 학습 (TFT)
 REM ============================================================
-echo [STEP 2/2] 모델 학습 시작...
+echo [STEP 2/2] 모델 학습 시작 (Temporal Fusion Transformer)...
 echo ============================================================
 
 set DATA_DIR=prepared_data
-set SAVE_DIR=global_model_v2
+set SAVE_DIR=global_model_tft
+set MODEL_TYPE=tft
 set EPOCHS=300
 set BATCH_SIZE=256
 set LR=0.001
@@ -59,7 +60,11 @@ set HEADING_LAMBDA=0.02
 set TURN_BOOST=2.0
 set VAL_RATIO=0.2
 set DEVICE=cuda
+set HIDDEN_DIM=128
 set EMBED_DIM=16
+set N_HEADS=4
+set NUM_LSTM_LAYERS=2
+set DROPOUT=0.1
 set CHUNK_SIZE=100
 
 "%PYTHON_EXE%" train_model.py ^
@@ -76,15 +81,20 @@ set CHUNK_SIZE=100
     --device %DEVICE% ^
     --save_dir %SAVE_DIR% ^
     --embed_dim %EMBED_DIM% ^
-    --chunk_size %CHUNK_SIZE%
+    --chunk_size %CHUNK_SIZE% ^
+    --model_type %MODEL_TYPE% ^
+    --hidden_dim %HIDDEN_DIM% ^
+    --n_heads %N_HEADS% ^
+    --num_lstm_layers %NUM_LSTM_LAYERS% ^
+    --dropout %DROPOUT%
 
 echo.
 echo ============================================================
 if %ERRORLEVEL% EQU 0 (
     echo 전체 파이프라인 완료!
     echo - 전처리 데이터: %OUTPUT_DIR%/
-    echo - 모델: %SAVE_DIR%/lstm_global_v2.pth
-    echo - 스케일러: %SAVE_DIR%/scaler_global_v2.npz
+    echo - 모델: %SAVE_DIR%/model_tft.pth
+    echo - 스케일러: %SAVE_DIR%/scaler_tft.npz
 ) else (
     echo 모델 학습 실패! (error code: %ERRORLEVEL%)
 )

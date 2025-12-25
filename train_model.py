@@ -220,6 +220,609 @@ class LSTMTrajectoryModelV2(nn.Module):
         return self.fc(out[:, -1, :])
 
 
+# =============================================================================
+# Temporal Fusion Transformer (TFT) Components
+# =============================================================================
+
+class GatedLinearUnit(nn.Module):
+    """Gated Linear Unit (GLU) - TFT의 기본 게이트 메커니즘"""
+    def __init__(self, input_dim, output_dim, dropout=0.1):
+        super().__init__()
+        self.fc = nn.Linear(input_dim, output_dim)
+        self.gate = nn.Linear(input_dim, output_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        return self.dropout(self.sigmoid(self.gate(x)) * self.fc(x))
+
+
+class GatedResidualNetwork(nn.Module):
+    """
+    Gated Residual Network (GRN)
+    - TFT의 핵심 빌딩 블록
+    - Skip connection + Gating으로 정보 흐름 제어
+    """
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1, context_dim=None):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.context_dim = context_dim
+
+        # 입력 투영
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+
+        # 컨텍스트 투영 (있는 경우)
+        if context_dim is not None:
+            self.context_fc = nn.Linear(context_dim, hidden_dim, bias=False)
+
+        # ELU + Linear
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.elu = nn.ELU()
+
+        # GLU
+        self.glu = GatedLinearUnit(hidden_dim, output_dim, dropout)
+
+        # Skip connection 투영 (차원이 다른 경우)
+        if input_dim != output_dim:
+            self.skip_proj = nn.Linear(input_dim, output_dim)
+        else:
+            self.skip_proj = None
+
+        # Layer Norm
+        self.layer_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x, context=None):
+        # Skip connection
+        residual = x if self.skip_proj is None else self.skip_proj(x)
+
+        # Main path
+        hidden = self.fc1(x)
+        if self.context_dim is not None and context is not None:
+            hidden = hidden + self.context_fc(context)
+        hidden = self.elu(hidden)
+        hidden = self.fc2(hidden)
+
+        # Gating
+        gated = self.glu(hidden)
+
+        # Add & Norm
+        return self.layer_norm(residual + gated)
+
+
+class VariableSelectionNetwork(nn.Module):
+    """
+    Variable Selection Network (VSN)
+    - 각 변수의 중요도를 학습하여 가중 합산
+    - 시계열 데이터에서 중요한 피처 자동 선택
+    """
+    def __init__(self, input_dim, num_inputs, hidden_dim, dropout=0.1, context_dim=None):
+        super().__init__()
+        self.num_inputs = num_inputs
+        self.hidden_dim = hidden_dim
+
+        # 각 변수별 GRN
+        self.var_grns = nn.ModuleList([
+            GatedResidualNetwork(input_dim, hidden_dim, hidden_dim, dropout)
+            for _ in range(num_inputs)
+        ])
+
+        # 변수 선택 가중치용 GRN
+        self.selection_grn = GatedResidualNetwork(
+            input_dim * num_inputs, hidden_dim, num_inputs, dropout, context_dim
+        )
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, inputs, context=None):
+        """
+        inputs: list of [B, T, D] or [B, D] tensors (num_inputs 개)
+        context: [B, C] optional context vector
+        """
+        # 각 변수 처리
+        processed = []
+        for i, var_input in enumerate(inputs):
+            processed.append(self.var_grns[i](var_input))
+
+        # 모든 입력 연결하여 선택 가중치 계산
+        concat_inputs = torch.cat(inputs, dim=-1)  # [B, T, D*num_inputs] or [B, D*num_inputs]
+
+        # Context 확장 (시계열인 경우)
+        if context is not None and len(concat_inputs.shape) == 3:
+            context = context.unsqueeze(1).expand(-1, concat_inputs.size(1), -1)
+
+        # 선택 가중치
+        selection_weights = self.selection_grn(concat_inputs, context)
+        selection_weights = self.softmax(selection_weights)  # [B, T, num_inputs] or [B, num_inputs]
+
+        # 가중 합산
+        if len(selection_weights.shape) == 2:
+            # [B, num_inputs] -> [B, num_inputs, 1]
+            selection_weights = selection_weights.unsqueeze(-1)
+            stacked = torch.stack(processed, dim=1)  # [B, num_inputs, D]
+            output = (stacked * selection_weights).sum(dim=1)  # [B, D]
+        else:
+            # [B, T, num_inputs] -> [B, T, num_inputs, 1]
+            selection_weights = selection_weights.unsqueeze(-1)
+            stacked = torch.stack(processed, dim=2)  # [B, T, num_inputs, D]
+            output = (stacked * selection_weights).sum(dim=2)  # [B, T, D]
+
+        return output, selection_weights.squeeze(-1)
+
+
+class InterpretableMultiHeadAttention(nn.Module):
+    """
+    Interpretable Multi-Head Attention
+    - 표준 Multi-Head Attention + 해석 가능한 가중치
+    """
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.d_k = d_model // n_heads
+
+        self.W_q = nn.Linear(d_model, d_model)
+        self.W_k = nn.Linear(d_model, d_model)
+        self.W_v = nn.Linear(d_model, d_model)
+        self.W_o = nn.Linear(d_model, d_model)
+
+        self.dropout = nn.Dropout(dropout)
+        self.scale = self.d_k ** -0.5
+
+    def forward(self, query, key, value, mask=None):
+        B, T, _ = query.shape
+
+        # Linear projections
+        Q = self.W_q(query).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
+        K = self.W_k(key).view(B, -1, self.n_heads, self.d_k).transpose(1, 2)
+        V = self.W_v(value).view(B, -1, self.n_heads, self.d_k).transpose(1, 2)
+
+        # Attention scores
+        scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+
+        attn_weights = torch.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+
+        # Attention output
+        context = torch.matmul(attn_weights, V)
+        context = context.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        output = self.W_o(context)
+
+        return output, attn_weights
+
+
+class TemporalFusionTransformer(nn.Module):
+    """
+    Temporal Fusion Transformer (TFT) for Ship Trajectory Prediction
+
+    구조:
+    1. Embedding Layer: 수치형 + 범주형 변수 임베딩
+    2. Variable Selection Network: 중요 변수 자동 선택
+    3. LSTM Encoder: 시계열 패턴 학습
+    4. Interpretable Multi-Head Attention: 시간적 의존성 포착
+    5. Gated Skip Connections: 정보 흐름 제어
+    6. Output Layer: 예측값 생성
+    """
+    def __init__(self,
+                 num_features=5,
+                 hidden_dim=128,
+                 output_dim=5,
+                 n_heads=4,
+                 dropout=0.1,
+                 num_mmsi=1000,
+                 num_start_area=50,
+                 num_end_area=50,
+                 num_grids=10000,
+                 embed_dim=16,
+                 num_lstm_layers=2):
+        super().__init__()
+
+        self.num_features = num_features
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
+        self.output_dim = output_dim
+
+        # ===================
+        # 1. Embedding Layers
+        # ===================
+        # 범주형 임베딩
+        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
+        self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
+        self.grid_embed = nn.Embedding(num_grids, embed_dim)
+
+        # 수치형 변수 투영 (각 변수를 hidden_dim으로)
+        self.numeric_projections = nn.ModuleList([
+            nn.Linear(1, hidden_dim) for _ in range(num_features)
+        ])
+
+        # 범주형 변수 투영
+        self.cat_projections = nn.ModuleList([
+            nn.Linear(embed_dim, hidden_dim) for _ in range(4)  # mmsi, start, end, grid
+        ])
+
+        # ===================
+        # 2. Variable Selection
+        # ===================
+        total_vars = num_features + 4  # 5 numeric + 4 categorical
+        self.var_selection = VariableSelectionNetwork(
+            input_dim=hidden_dim,
+            num_inputs=total_vars,
+            hidden_dim=hidden_dim,
+            dropout=dropout
+        )
+
+        # ===================
+        # 3. LSTM Encoder
+        # ===================
+        self.lstm_encoder = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_lstm_layers,
+            batch_first=True,
+            dropout=dropout if num_lstm_layers > 1 else 0
+        )
+
+        # LSTM 출력 게이트
+        self.lstm_gate = GatedLinearUnit(hidden_dim, hidden_dim, dropout)
+        self.lstm_norm = nn.LayerNorm(hidden_dim)
+
+        # ===================
+        # 4. Static Enrichment (GRN)
+        # ===================
+        self.static_enrichment = GatedResidualNetwork(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim,
+            output_dim=hidden_dim,
+            dropout=dropout
+        )
+
+        # ===================
+        # 5. Temporal Self-Attention
+        # ===================
+        self.multihead_attn = InterpretableMultiHeadAttention(
+            d_model=hidden_dim,
+            n_heads=n_heads,
+            dropout=dropout
+        )
+
+        # Attention 후 게이트
+        self.attn_gate = GatedLinearUnit(hidden_dim, hidden_dim, dropout)
+        self.attn_norm = nn.LayerNorm(hidden_dim)
+
+        # ===================
+        # 6. Position-wise Feed-Forward
+        # ===================
+        self.ff_grn = GatedResidualNetwork(
+            input_dim=hidden_dim,
+            hidden_dim=hidden_dim * 4,
+            output_dim=hidden_dim,
+            dropout=dropout
+        )
+
+        # ===================
+        # 7. Output Layer
+        # ===================
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x_num, x_cat):
+        """
+        x_num: [B, T, 5] - 수치형 (lat, lon, sog, sin_cog, cos_cog)
+        x_cat: [B, T, 4] - 범주형 (mmsi_idx, start_idx, end_idx, grid_id)
+        """
+        B, T, _ = x_num.shape
+
+        # ===================
+        # 1. Embedding
+        # ===================
+        # 수치형 변수 투영
+        numeric_vars = []
+        for i in range(self.num_features):
+            var = x_num[:, :, i:i+1]  # [B, T, 1]
+            projected = self.numeric_projections[i](var)  # [B, T, hidden_dim]
+            numeric_vars.append(projected)
+
+        # 범주형 임베딩 + 투영
+        mmsi_emb = self.cat_projections[0](self.mmsi_embed(x_cat[:, :, 0]))
+        start_emb = self.cat_projections[1](self.start_area_embed(x_cat[:, :, 1]))
+        end_emb = self.cat_projections[2](self.end_area_embed(x_cat[:, :, 2]))
+        grid_emb = self.cat_projections[3](self.grid_embed(x_cat[:, :, 3]))
+
+        cat_vars = [mmsi_emb, start_emb, end_emb, grid_emb]
+
+        # ===================
+        # 2. Variable Selection
+        # ===================
+        all_vars = numeric_vars + cat_vars  # 9개 변수
+        selected, var_weights = self.var_selection(all_vars)  # [B, T, hidden_dim]
+
+        # ===================
+        # 3. LSTM Encoder
+        # ===================
+        lstm_out, _ = self.lstm_encoder(selected)  # [B, T, hidden_dim]
+
+        # Gated skip connection
+        lstm_gated = self.lstm_gate(lstm_out)
+        lstm_out = self.lstm_norm(selected + lstm_gated)
+
+        # ===================
+        # 4. Static Enrichment
+        # ===================
+        enriched = self.static_enrichment(lstm_out)  # [B, T, hidden_dim]
+
+        # ===================
+        # 5. Temporal Self-Attention
+        # ===================
+        # Causal mask (미래 정보 차단)
+        mask = torch.triu(torch.ones(T, T, device=x_num.device), diagonal=1).bool()
+        mask = ~mask  # 0을 마스킹
+
+        attn_out, attn_weights = self.multihead_attn(enriched, enriched, enriched, mask)
+
+        # Gated skip connection
+        attn_gated = self.attn_gate(attn_out)
+        attn_out = self.attn_norm(enriched + attn_gated)
+
+        # ===================
+        # 6. Feed-Forward
+        # ===================
+        ff_out = self.ff_grn(attn_out)  # [B, T, hidden_dim]
+
+        # ===================
+        # 7. Output (마지막 타임스텝만)
+        # ===================
+        final_hidden = ff_out[:, -1, :]  # [B, hidden_dim]
+        output = self.output_layer(final_hidden)  # [B, output_dim]
+
+        return output
+
+    def get_attention_weights(self, x_num, x_cat):
+        """Attention 가중치 반환 (해석용)"""
+        self.eval()
+        with torch.no_grad():
+            B, T, _ = x_num.shape
+
+            # Forward pass와 동일하지만 attention weights 반환
+            numeric_vars = []
+            for i in range(self.num_features):
+                var = x_num[:, :, i:i+1]
+                projected = self.numeric_projections[i](var)
+                numeric_vars.append(projected)
+
+            mmsi_emb = self.cat_projections[0](self.mmsi_embed(x_cat[:, :, 0]))
+            start_emb = self.cat_projections[1](self.start_area_embed(x_cat[:, :, 1]))
+            end_emb = self.cat_projections[2](self.end_area_embed(x_cat[:, :, 2]))
+            grid_emb = self.cat_projections[3](self.grid_embed(x_cat[:, :, 3]))
+
+            cat_vars = [mmsi_emb, start_emb, end_emb, grid_emb]
+            all_vars = numeric_vars + cat_vars
+
+            selected, var_weights = self.var_selection(all_vars)
+            lstm_out, _ = self.lstm_encoder(selected)
+            lstm_gated = self.lstm_gate(lstm_out)
+            lstm_out = self.lstm_norm(selected + lstm_gated)
+            enriched = self.static_enrichment(lstm_out)
+
+            mask = torch.triu(torch.ones(T, T, device=x_num.device), diagonal=1).bool()
+            mask = ~mask
+
+            _, attn_weights = self.multihead_attn(enriched, enriched, enriched, mask)
+
+        return var_weights, attn_weights
+
+
+# =============================================================================
+# LSTM + Attention Model
+# =============================================================================
+
+class LSTMAttentionModel(nn.Module):
+    """
+    LSTM + Attention 모델
+    - LSTM으로 시퀀스 인코딩 후 Attention으로 중요 타임스텝 가중
+    - TFT보다 단순하지만 순수 LSTM보다 성능 향상
+    """
+    def __init__(self,
+                 num_features=5,
+                 hidden_dim=128,
+                 num_layers=2,
+                 output_dim=5,
+                 dropout=0.2,
+                 num_mmsi=1000,
+                 num_start_area=50,
+                 num_end_area=50,
+                 num_grids=10000,
+                 embed_dim=16,
+                 n_heads=4):
+        super().__init__()
+
+        self.num_features = num_features
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
+
+        # Embeddings
+        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
+        self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
+        self.grid_embed = nn.Embedding(num_grids, embed_dim)
+
+        # LSTM
+        lstm_input_dim = num_features + 4 * embed_dim
+        self.lstm = nn.LSTM(lstm_input_dim, hidden_dim, num_layers,
+                           batch_first=True, dropout=dropout, bidirectional=False)
+
+        # Multi-Head Attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+
+        # Layer Norm
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+
+        # Output
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x_num, x_cat):
+        B, T, _ = x_num.shape
+
+        # Embeddings
+        mmsi_emb = self.mmsi_embed(x_cat[:, :, 0])
+        start_emb = self.start_area_embed(x_cat[:, :, 1])
+        end_emb = self.end_area_embed(x_cat[:, :, 2])
+        grid_emb = self.grid_embed(x_cat[:, :, 3])
+
+        x = torch.cat([x_num, mmsi_emb, start_emb, end_emb, grid_emb], dim=-1)
+
+        # LSTM encoding
+        lstm_out, _ = self.lstm(x)  # [B, T, hidden_dim]
+
+        # Self-Attention (causal mask)
+        causal_mask = torch.triu(torch.ones(T, T, device=x_num.device), diagonal=1).bool()
+
+        attn_out, _ = self.attention(
+            lstm_out, lstm_out, lstm_out,
+            attn_mask=causal_mask,
+            need_weights=False
+        )
+
+        # Residual + LayerNorm
+        out = self.layer_norm(lstm_out + attn_out)
+
+        # 마지막 타임스텝
+        return self.fc(out[:, -1, :])
+
+
+# =============================================================================
+# Pure Transformer Model
+# =============================================================================
+
+class PositionalEncoding(nn.Module):
+    """Sinusoidal Positional Encoding"""
+    def __init__(self, d_model, max_len=500, dropout=0.1):
+        super().__init__()
+        self.dropout = nn.Dropout(dropout)
+
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
+
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [B, T, D]
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
+class TransformerTrajectoryModel(nn.Module):
+    """
+    Pure Transformer 모델 (LSTM 없음)
+    - 순수 Self-Attention 기반
+    - 병렬 처리로 빠른 학습
+    """
+    def __init__(self,
+                 num_features=5,
+                 hidden_dim=128,
+                 output_dim=5,
+                 n_heads=4,
+                 num_layers=4,
+                 dropout=0.1,
+                 num_mmsi=1000,
+                 num_start_area=50,
+                 num_end_area=50,
+                 num_grids=10000,
+                 embed_dim=16,
+                 max_seq_len=100):
+        super().__init__()
+
+        self.num_features = num_features
+        self.hidden_dim = hidden_dim
+        self.embed_dim = embed_dim
+
+        # Embeddings
+        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
+        self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
+        self.grid_embed = nn.Embedding(num_grids, embed_dim)
+
+        # Input projection
+        input_dim = num_features + 4 * embed_dim
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        # Positional Encoding
+        self.pos_encoder = PositionalEncoding(hidden_dim, max_seq_len, dropout)
+
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True  # Pre-LN for stability
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output
+        self.output_layer = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x_num, x_cat):
+        B, T, _ = x_num.shape
+
+        # Embeddings
+        mmsi_emb = self.mmsi_embed(x_cat[:, :, 0])
+        start_emb = self.start_area_embed(x_cat[:, :, 1])
+        end_emb = self.end_area_embed(x_cat[:, :, 2])
+        grid_emb = self.grid_embed(x_cat[:, :, 3])
+
+        x = torch.cat([x_num, mmsi_emb, start_emb, end_emb, grid_emb], dim=-1)
+
+        # Input projection
+        x = self.input_proj(x)  # [B, T, hidden_dim]
+
+        # Positional Encoding
+        x = self.pos_encoder(x)
+
+        # Causal mask (미래 정보 차단)
+        causal_mask = torch.triu(
+            torch.ones(T, T, device=x_num.device),
+            diagonal=1
+        ).bool()
+
+        # Transformer Encoder
+        out = self.transformer_encoder(x, mask=causal_mask)  # [B, T, hidden_dim]
+
+        # 마지막 타임스텝
+        return self.output_layer(out[:, -1, :])
+
+
 def loss_with_smoothness(y_pred, y_true, x_last,
                          w_mse=(2, 2, 1, 3, 3),
                          smooth_lambda=0.05,
@@ -302,6 +905,11 @@ def train_model(
     val_ratio=0.2,
     seed=42,
     chunk_size=100,  # 한 번에 GPU에 올릴 segment 수
+    model_type="tft",  # "lstm" or "tft"
+    hidden_dim=128,
+    n_heads=4,
+    num_lstm_layers=2,
+    dropout=0.1,
 ):
     """모델 학습"""
     if device is None:
@@ -355,18 +963,83 @@ def train_model(
     print(f"  - train chunks: {chunked_trainer.n_train_chunks}, val chunks: {chunked_trainer.n_val_chunks}")
 
     # 모델 생성
-    model = LSTMTrajectoryModelV2(
-        num_features=5,
-        hidden_dim=128,
-        num_layers=2,
-        output_dim=5,
-        dropout=0.2,
-        num_mmsi=int(meta['num_mmsi']),
-        num_start_area=int(meta['num_start_area']),
-        num_end_area=int(meta['num_end_area']),
-        num_grids=int(meta['total_grids']) + 1,
-        embed_dim=embed_dim,
-    ).to(device)
+    print(f"\n[INFO] 모델 타입: {model_type.upper()}")
+
+    model_type_lower = model_type.lower()
+
+    if model_type_lower == "tft":
+        model = TemporalFusionTransformer(
+            num_features=5,
+            hidden_dim=hidden_dim,
+            output_dim=5,
+            n_heads=n_heads,
+            dropout=dropout,
+            num_mmsi=int(meta['num_mmsi']),
+            num_start_area=int(meta['num_start_area']),
+            num_end_area=int(meta['num_end_area']),
+            num_grids=int(meta['total_grids']) + 1,
+            embed_dim=embed_dim,
+            num_lstm_layers=num_lstm_layers,
+        ).to(device)
+        model_filename = "model_tft.pth"
+        scaler_filename = "scaler_tft.npz"
+
+    elif model_type_lower == "transformer":
+        model = TransformerTrajectoryModel(
+            num_features=5,
+            hidden_dim=hidden_dim,
+            output_dim=5,
+            n_heads=n_heads,
+            num_layers=num_lstm_layers,  # Transformer layers
+            dropout=dropout,
+            num_mmsi=int(meta['num_mmsi']),
+            num_start_area=int(meta['num_start_area']),
+            num_end_area=int(meta['num_end_area']),
+            num_grids=int(meta['total_grids']) + 1,
+            embed_dim=embed_dim,
+            max_seq_len=seq_len + 10,
+        ).to(device)
+        model_filename = "model_transformer.pth"
+        scaler_filename = "scaler_transformer.npz"
+
+    elif model_type_lower == "lstm_attn":
+        model = LSTMAttentionModel(
+            num_features=5,
+            hidden_dim=hidden_dim,
+            num_layers=num_lstm_layers,
+            output_dim=5,
+            dropout=dropout,
+            num_mmsi=int(meta['num_mmsi']),
+            num_start_area=int(meta['num_start_area']),
+            num_end_area=int(meta['num_end_area']),
+            num_grids=int(meta['total_grids']) + 1,
+            embed_dim=embed_dim,
+            n_heads=n_heads,
+        ).to(device)
+        model_filename = "model_lstm_attn.pth"
+        scaler_filename = "scaler_lstm_attn.npz"
+
+    else:  # lstm (default)
+        model = LSTMTrajectoryModelV2(
+            num_features=5,
+            hidden_dim=hidden_dim,
+            num_layers=num_lstm_layers,
+            output_dim=5,
+            dropout=dropout,
+            num_mmsi=int(meta['num_mmsi']),
+            num_start_area=int(meta['num_start_area']),
+            num_end_area=int(meta['num_end_area']),
+            num_grids=int(meta['total_grids']) + 1,
+            embed_dim=embed_dim,
+        ).to(device)
+        model_filename = "model_lstm.pth"
+        scaler_filename = "scaler_lstm.npz"
+
+    # 모델 파라미터 수 출력
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  - Total parameters: {total_params:,}")
+    print(f"  - Trainable parameters: {trainable_params:,}")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -381,8 +1054,8 @@ def train_model(
     checkpoint_dir = os.path.join(save_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    model_path = os.path.join(save_dir, "lstm_global_v2.pth")
-    scaler_path = os.path.join(save_dir, "scaler_global_v2.npz")
+    model_path = os.path.join(save_dir, model_filename)
+    scaler_path = os.path.join(save_dir, scaler_filename)
 
     # 학습 루프
     best_val = float("inf")
@@ -574,6 +1247,12 @@ def train_model(
                 heading_lambda=float(heading_lambda),
                 lat_bounds=meta['lat_bounds'],
                 lon_bounds=meta['lon_bounds'],
+                # TFT 추가 정보
+                model_type=model_type,
+                hidden_dim=int(hidden_dim),
+                n_heads=int(n_heads),
+                num_lstm_layers=int(num_lstm_layers),
+                dropout=float(dropout),
             )
             print(f"  [BEST] 최고 모델 갱신됨 (epoch={epoch}, val_loss={va_loss:.6f})")
         else:
@@ -596,6 +1275,33 @@ def train_model(
     gc.collect()
 
     return model_path, scaler_path
+
+
+def select_model_type():
+    """사용자에게 모델 타입 선택 요청"""
+    print("\n" + "=" * 60)
+    print("모델 선택")
+    print("=" * 60)
+    print("1. LSTM        - 기본 LSTM 모델 (빠른 학습, 가벼움)")
+    print("2. LSTM+Attn   - LSTM + Attention (균형잡힌 성능)")
+    print("3. Transformer - 순수 Transformer (병렬 처리, 빠른 학습)")
+    print("4. TFT         - Temporal Fusion Transformer (최고 정확도)")
+    print("=" * 60)
+
+    model_map = {
+        "1": "lstm",
+        "2": "lstm_attn",
+        "3": "transformer",
+        "4": "tft",
+        "": "tft"  # 기본값
+    }
+
+    while True:
+        choice = input("모델을 선택하세요 (1-4, 기본값=4): ").strip()
+        if choice in model_map:
+            return model_map[choice]
+        else:
+            print("잘못된 입력입니다. 1, 2, 3, 4 중 하나를 입력하세요.")
 
 
 def main():
@@ -633,12 +1339,28 @@ def main():
                         help="모델 저장 폴더 (기본값: global_model_v2)")
     parser.add_argument("--chunk_size", type=int, default=100,
                         help="한 번에 GPU에 올릴 segment 수 (기본값: 100)")
+    parser.add_argument("--model_type", type=str, default=None,
+                        choices=["lstm", "lstm_attn", "transformer", "tft"],
+                        help="모델 타입: lstm/lstm_attn/transformer/tft (미지정시 대화형 선택)")
+    parser.add_argument("--hidden_dim", type=int, default=128,
+                        help="Hidden dimension (기본값: 128)")
+    parser.add_argument("--n_heads", type=int, default=4,
+                        help="Attention heads 수 (TFT 전용, 기본값: 4)")
+    parser.add_argument("--num_lstm_layers", type=int, default=2,
+                        help="LSTM 레이어 수 (기본값: 2)")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                        help="Dropout 비율 (기본값: 0.1)")
 
     args = parser.parse_args()
 
-    print("=" * 60)
+    # 모델 타입이 지정되지 않으면 대화형으로 선택
+    if args.model_type is None:
+        args.model_type = select_model_type()
+
+    print("\n" + "=" * 60)
     print("모델 학습 (전처리된 데이터 사용)")
     print("=" * 60)
+    print(f"모델 타입: {args.model_type.upper()}")
     print(f"데이터 폴더: {args.data_dir}")
     print(f"저장 폴더: {args.save_dir}")
     print(f"장치: {args.device}")
@@ -667,6 +1389,11 @@ def main():
         embed_dim=args.embed_dim,
         val_ratio=args.val_ratio,
         chunk_size=args.chunk_size,
+        model_type=args.model_type,
+        hidden_dim=args.hidden_dim,
+        n_heads=args.n_heads,
+        num_lstm_layers=args.num_lstm_layers,
+        dropout=args.dropout,
     )
 
     print("\n" + "=" * 60)

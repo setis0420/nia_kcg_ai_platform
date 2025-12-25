@@ -2,7 +2,7 @@
 chcp 65001 > nul
 
 echo ============================================================
-echo Model Training - Ship Trajectory Prediction V2
+echo Model Training - Ship Trajectory Prediction (TFT/LSTM)
 echo ============================================================
 
 REM Python path (kki_gpu2 conda env)
@@ -10,7 +10,7 @@ set PYTHON_EXE=C:\Users\user\anaconda3\envs\kki_gpu2\python.exe
 
 REM Data & Model settings
 set DATA_DIR=prepared_data
-set SAVE_DIR=global_model_v2
+set SAVE_DIR=trained_model
 
 REM Training hyperparameters
 set EPOCHS=300
@@ -24,8 +24,12 @@ set TURN_BOOST=2.0
 set VAL_RATIO=0.2
 set DEVICE=cuda
 
-REM Embedding settings
+REM Model architecture
+set HIDDEN_DIM=128
 set EMBED_DIM=16
+set N_HEADS=4
+set NUM_LSTM_LAYERS=2
+set DROPOUT=0.1
 
 REM Memory settings
 set CHUNK_SIZE=100
@@ -37,11 +41,7 @@ echo Data folder: %DATA_DIR%
 echo Save folder: %SAVE_DIR%
 echo Device: %DEVICE%
 echo Epochs: %EPOCHS%
-echo Batch Size: %BATCH_SIZE%
-echo Embed Dim: %EMBED_DIM%
-echo Chunk Size: %CHUNK_SIZE%
 echo ============================================================
-echo.
 
 "%PYTHON_EXE%" train_model.py ^
     --data_dir %DATA_DIR% ^
@@ -57,7 +57,11 @@ echo.
     --device %DEVICE% ^
     --save_dir %SAVE_DIR% ^
     --embed_dim %EMBED_DIM% ^
-    --chunk_size %CHUNK_SIZE%
+    --chunk_size %CHUNK_SIZE% ^
+    --hidden_dim %HIDDEN_DIM% ^
+    --n_heads %N_HEADS% ^
+    --num_lstm_layers %NUM_LSTM_LAYERS% ^
+    --dropout %DROPOUT%
 
 echo.
 echo ============================================================
