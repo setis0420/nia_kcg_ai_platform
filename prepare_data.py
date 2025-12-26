@@ -3,6 +3,7 @@
 학습 데이터 전처리 및 저장 (Multiprocessing 버전)
 ================================================
 멀티프로세싱을 사용하여 병렬 처리
++ 해역 경계 마스크 및 밀도 기반 기준 항로 생성
 
 사용법:
     python prepare_data.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \
@@ -20,6 +21,12 @@ from functools import partial
 import numpy as np
 import pandas as pd
 import warnings
+
+try:
+    from scipy import ndimage
+    HAS_SCIPY = True
+except ImportError:
+    HAS_SCIPY = False
 
 warnings.filterwarnings("ignore")
 
@@ -48,6 +55,167 @@ def create_grid_mapping(lat_min, lat_max, lon_min, lon_max, grid_size=0.05):
         'num_cols': num_cols,
         'total_grids': num_rows * num_cols
     }
+
+
+# ============================================================
+# 해역 경계 및 기준 항로 생성 함수들
+# ============================================================
+
+def create_valid_sea_mask(all_lat, all_lon, grid_size=0.01, min_count=1, expand_pixels=1):
+    """
+    유효 해역 마스크 생성 - 항적이 있었던 격자만 허용
+
+    Args:
+        all_lat, all_lon: 모든 항적의 위경도 배열
+        grid_size: 격자 크기 (도 단위, 기본값 0.01도 ≈ 1.1km)
+        min_count: 최소 항적 수
+        expand_pixels: 마스크 확장 픽셀 수
+
+    Returns:
+        dict: 해역 마스크 정보
+    """
+    lat_min, lat_max = all_lat.min(), all_lat.max()
+    lon_min, lon_max = all_lon.min(), all_lon.max()
+
+    # 여유 추가
+    margin = grid_size * 2
+    lat_min -= margin
+    lat_max += margin
+    lon_min -= margin
+    lon_max += margin
+
+    num_rows = int(np.ceil((lat_max - lat_min) / grid_size)) + 1
+    num_cols = int(np.ceil((lon_max - lon_min) / grid_size)) + 1
+
+    # 격자별 카운트
+    grid_count = np.zeros((num_rows, num_cols), dtype=np.int32)
+
+    for lat, lon in zip(all_lat, all_lon):
+        row = int((lat - lat_min) / grid_size)
+        col = int((lon - lon_min) / grid_size)
+        if 0 <= row < num_rows and 0 <= col < num_cols:
+            grid_count[row, col] += 1
+
+    # 유효 해역 마스크
+    valid_mask = grid_count >= min_count
+
+    # 확장 (주변 격자도 허용)
+    if expand_pixels > 0 and HAS_SCIPY:
+        valid_mask = ndimage.binary_dilation(valid_mask, iterations=expand_pixels)
+
+    valid_count = np.sum(valid_mask)
+    total_count = num_rows * num_cols
+
+    print(f"[SEA-MASK] 유효 해역: {valid_count:,} / {total_count:,} ({100*valid_count/total_count:.1f}%)")
+
+    return {
+        'valid_mask': valid_mask,
+        'grid_count': grid_count,
+        'lat_min': lat_min,
+        'lat_max': lat_max,
+        'lon_min': lon_min,
+        'lon_max': lon_max,
+        'grid_size': grid_size,
+        'num_rows': num_rows,
+        'num_cols': num_cols,
+    }
+
+
+def create_density_routes(all_lat, all_lon, grid_size=0.005, top_percentile=80):
+    """
+    밀도 기반 기준 항로 생성 - 항적이 밀집된 격자들을 추출
+
+    Args:
+        all_lat, all_lon: 모든 항적의 위경도 배열
+        grid_size: 격자 크기 (도 단위, 기본값 0.005도 ≈ 550m)
+        top_percentile: 상위 N% 밀도를 기준 항로로 지정
+
+    Returns:
+        dict: 기준 항로 정보
+    """
+    lat_min, lat_max = all_lat.min(), all_lat.max()
+    lon_min, lon_max = all_lon.min(), all_lon.max()
+
+    num_rows = int(np.ceil((lat_max - lat_min) / grid_size)) + 1
+    num_cols = int(np.ceil((lon_max - lon_min) / grid_size)) + 1
+
+    # 격자별 밀도
+    density_grid = np.zeros((num_rows, num_cols), dtype=np.float32)
+
+    for lat, lon in zip(all_lat, all_lon):
+        row = int((lat - lat_min) / grid_size)
+        col = int((lon - lon_min) / grid_size)
+        if 0 <= row < num_rows and 0 <= col < num_cols:
+            density_grid[row, col] += 1
+
+    # 정규화
+    if density_grid.max() > 0:
+        density_grid = density_grid / density_grid.max()
+
+    # 상위 밀도 격자 추출
+    nonzero_density = density_grid[density_grid > 0]
+    if len(nonzero_density) > 0:
+        threshold = np.percentile(nonzero_density, top_percentile)
+        high_density_mask = density_grid >= threshold
+    else:
+        threshold = 0
+        high_density_mask = density_grid > 0
+
+    # 고밀도 격자의 중심점 추출
+    high_density_points = []
+    rows, cols = np.where(high_density_mask)
+    for r, c in zip(rows, cols):
+        center_lat = lat_min + (r + 0.5) * grid_size
+        center_lon = lon_min + (c + 0.5) * grid_size
+        high_density_points.append([center_lat, center_lon, density_grid[r, c]])
+
+    high_density_points = np.array(high_density_points) if high_density_points else np.array([]).reshape(0, 3)
+
+    print(f"[ROUTE] 기준 항로 격자: {len(high_density_points):,} 개 (상위 {100-top_percentile}%)")
+
+    return {
+        'density_grid': density_grid,
+        'high_density_mask': high_density_mask,
+        'high_density_points': high_density_points,
+        'lat_min': lat_min,
+        'lat_max': lat_max,
+        'lon_min': lon_min,
+        'lon_max': lon_max,
+        'grid_size': grid_size,
+        'num_rows': num_rows,
+        'num_cols': num_cols,
+        'threshold': threshold,
+    }
+
+
+def save_boundary_data(sea_mask_info, route_info, output_path):
+    """해역 경계 데이터 저장 (npz 형식)"""
+    np.savez_compressed(
+        output_path,
+        # 해역 마스크
+        valid_mask=sea_mask_info['valid_mask'],
+        grid_count=sea_mask_info['grid_count'],
+        mask_lat_min=sea_mask_info['lat_min'],
+        mask_lat_max=sea_mask_info['lat_max'],
+        mask_lon_min=sea_mask_info['lon_min'],
+        mask_lon_max=sea_mask_info['lon_max'],
+        mask_grid_size=sea_mask_info['grid_size'],
+        mask_num_rows=sea_mask_info['num_rows'],
+        mask_num_cols=sea_mask_info['num_cols'],
+        # 밀도 항로
+        density_grid=route_info['density_grid'],
+        high_density_mask=route_info['high_density_mask'],
+        high_density_points=route_info['high_density_points'],
+        route_lat_min=route_info['lat_min'],
+        route_lat_max=route_info['lat_max'],
+        route_lon_min=route_info['lon_min'],
+        route_lon_max=route_info['lon_max'],
+        route_grid_size=route_info['grid_size'],
+        route_num_rows=route_info['num_rows'],
+        route_num_cols=route_info['num_cols'],
+        route_threshold=route_info['threshold'],
+    )
+    print(f"[SAVED] 해역 경계 데이터: {output_path}")
 
 
 def split_by_gap(df, max_gap_days=1):
@@ -149,7 +317,7 @@ def load_transition_data(transition_folder):
     df_list = []
     for f in file_list:
         file_path = os.path.join(transition_folder, f)
-        df = pd.read_csv(file_path)
+        df = pd.read_csv(file_path, encoding='utf-8-sig')
         df['source_file'] = f
         df_list.append(df)
 
@@ -226,6 +394,8 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
             'start_area_set': set(),
             'end_area_set': set(),
             'segment_infos': [],
+            'all_lat': [],
+            'all_lon': [],
         }
 
         for seg_idx, seg_df in enumerate(segments):
@@ -260,6 +430,14 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
             result['lat_max'] = max(result['lat_max'], intp_df["lat"].max())
             result['lon_min'] = min(result['lon_min'], intp_df["lon"].min())
             result['lon_max'] = max(result['lon_max'], intp_df["lon"].max())
+
+            # 해역 경계 생성용 좌표 수집 (샘플링하여 메모리 절약)
+            lat_arr = intp_df["lat"].values
+            lon_arr = intp_df["lon"].values
+            # 10개 중 1개만 샘플링
+            sample_idx = np.arange(0, len(lat_arr), 10)
+            result['all_lat'].extend(lat_arr[sample_idx].tolist())
+            result['all_lon'].extend(lon_arr[sample_idx].tolist())
 
             result['mmsi_set'].add(file_info['mmsi'])
             result['start_area_set'].add(intp_df["start_area"].iloc[0])
@@ -386,9 +564,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("--data_folder", type=str, required=True,
+    parser.add_argument("--data_folder", type=str,
+                        default=r"G:\NIA_ai_project\항적데이터 추출\여수_테스트",
                         help="항적 CSV 파일이 저장된 폴더")
-    parser.add_argument("--transition_folder", type=str, required=True,
+    parser.add_argument("--transition_folder", type=str,
+                        default="area_transition_results",
                         help="전이 정보 CSV 파일이 저장된 폴더")
     parser.add_argument("--output_dir", type=str, default="prepared_data",
                         help="전처리된 데이터 저장 폴더 (기본값: prepared_data)")
@@ -400,6 +580,12 @@ def main():
                         help="격자 크기 (도 단위, 기본값: 0.05)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="병렬 처리 워커 수 (기본값: 4)")
+    parser.add_argument("--mask_grid_size", type=float, default=0.01,
+                        help="해역 마스크 격자 크기 (도, 기본값: 0.01)")
+    parser.add_argument("--route_grid_size", type=float, default=0.005,
+                        help="항로 밀도 격자 크기 (도, 기본값: 0.005)")
+    parser.add_argument("--route_percentile", type=float, default=80,
+                        help="기준 항로 밀도 백분위 (기본값: 80)")
 
     args = parser.parse_args()
 
@@ -450,6 +636,9 @@ def main():
     end_area_set = set()
     segment_info_list = []
 
+    all_lat_list = []
+    all_lon_list = []
+
     for r in results:
         if r is None:
             continue
@@ -464,8 +653,36 @@ def main():
         start_area_set.update(r['start_area_set'])
         end_area_set.update(r['end_area_set'])
         segment_info_list.extend(r['segment_infos'])
+        all_lat_list.extend(r['all_lat'])
+        all_lon_list.extend(r['all_lon'])
 
     del results
+    gc.collect()
+
+    # 해역 경계 및 기준 항로 생성
+    print(f"\n[STEP 2.5] 해역 경계 및 기준 항로 생성")
+    all_lat_arr = np.array(all_lat_list)
+    all_lon_arr = np.array(all_lon_list)
+    print(f"[INFO] 수집된 좌표 수: {len(all_lat_arr):,}")
+
+    sea_mask_info = create_valid_sea_mask(
+        all_lat_arr, all_lon_arr,
+        grid_size=args.mask_grid_size,
+        min_count=1,
+        expand_pixels=1
+    )
+
+    route_info = create_density_routes(
+        all_lat_arr, all_lon_arr,
+        grid_size=args.route_grid_size,
+        top_percentile=args.route_percentile
+    )
+
+    # 해역 경계 저장
+    boundary_path = os.path.join(args.output_dir, "sea_boundary.npz")
+    save_boundary_data(sea_mask_info, route_info, boundary_path)
+
+    del all_lat_list, all_lon_list, all_lat_arr, all_lon_arr
     gc.collect()
 
     print(f"[INFO] 유효 segment 수: {len(segment_info_list)}")
@@ -642,6 +859,9 @@ def main():
     print("\n" + "=" * 60)
     print("전처리 완료!")
     print(f"저장 위치: {args.output_dir}/")
+    print(f"  - training_data.npz: 학습 데이터")
+    print(f"  - meta.npz: 메타 정보")
+    print(f"  - sea_boundary.npz: 해역 경계 및 기준 항로")
     print("=" * 60)
 
 

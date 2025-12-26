@@ -48,7 +48,7 @@ echo [STEP 2/2] 모델 학습 시작 (Temporal Fusion Transformer)...
 echo ============================================================
 
 set DATA_DIR=prepared_data
-set SAVE_DIR=global_model_tft
+set SAVE_DIR=model/yeosu
 set MODEL_TYPE=tft
 set EPOCHS=300
 set BATCH_SIZE=256
@@ -93,8 +93,8 @@ echo ============================================================
 if %ERRORLEVEL% EQU 0 (
     echo 전체 파이프라인 완료!
     echo - 전처리 데이터: %OUTPUT_DIR%/
-    echo - 모델: %SAVE_DIR%/model_tft.pth
-    echo - 스케일러: %SAVE_DIR%/scaler_tft.npz
+    echo - 모델: %SAVE_DIR%/model_%MODEL_TYPE%/model_%MODEL_TYPE%.pth
+    echo - 스케일러: %SAVE_DIR%/model_%MODEL_TYPE%/scaler_%MODEL_TYPE%.npz
 ) else (
     echo 모델 학습 실패! (error code: %ERRORLEVEL%)
 )

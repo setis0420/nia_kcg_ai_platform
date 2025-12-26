@@ -22,7 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 EPOCHS = 300
 BATCH_SIZE = 256
 LR = 1e-3
-SAVE_DIR = "global_model_v2"
+SAVE_DIR = "model/yeosu"  # 모델별 하위 폴더가 자동 생성됨
 
 
 class TrajectoryDatasetFromNpz(Dataset):
@@ -889,9 +889,9 @@ def train_model(
     lr=LR,
     save_dir=SAVE_DIR,
     device=None,
-    patience=30,
+    patience=50,
     min_delta=1e-5,
-    warmup_epochs=20,
+    warmup_epochs=50,
     use_scheduler=True,
     lr_patience=8,
     lr_factor=0.5,
@@ -899,7 +899,7 @@ def train_model(
     smooth_lambda=0.05,
     sog_lambda=0.10,
     heading_lambda=0.02,
-    turn_boost=2.0,
+    turn_boost=3.0,
     embed_dim=16,
     grad_clip_norm=1.0,
     val_ratio=0.2,
@@ -1049,13 +1049,15 @@ def train_model(
             optimizer, mode="min", factor=lr_factor, patience=lr_patience, min_lr=min_lr, verbose=True
         )
 
-    # 저장 경로
-    os.makedirs(save_dir, exist_ok=True)
-    checkpoint_dir = os.path.join(save_dir, "checkpoints")
+    # 저장 경로 (model/yeosu/model_{model_type}/ 구조)
+    model_type_lower = model_type.lower()
+    model_save_dir = os.path.join(save_dir, f"model_{model_type_lower}")
+    os.makedirs(model_save_dir, exist_ok=True)
+    checkpoint_dir = os.path.join(model_save_dir, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    model_path = os.path.join(save_dir, model_filename)
-    scaler_path = os.path.join(save_dir, scaler_filename)
+    model_path = os.path.join(model_save_dir, model_filename)
+    scaler_path = os.path.join(model_save_dir, scaler_filename)
 
     # 학습 루프
     best_val = float("inf")
@@ -1335,8 +1337,8 @@ def main():
     parser.add_argument("--device", type=str, default="cuda",
                         choices=["cuda", "cpu"],
                         help="학습 장치 (기본값: cuda)")
-    parser.add_argument("--save_dir", type=str, default="global_model_v2",
-                        help="모델 저장 폴더 (기본값: global_model_v2)")
+    parser.add_argument("--save_dir", type=str, default="model/yeosu",
+                        help="모델 저장 폴더 (기본값: model/yeosu)")
     parser.add_argument("--chunk_size", type=int, default=100,
                         help="한 번에 GPU에 올릴 segment 수 (기본값: 100)")
     parser.add_argument("--model_type", type=str, default=None,
@@ -1362,7 +1364,7 @@ def main():
     print("=" * 60)
     print(f"모델 타입: {args.model_type.upper()}")
     print(f"데이터 폴더: {args.data_dir}")
-    print(f"저장 폴더: {args.save_dir}")
+    print(f"저장 폴더: {args.save_dir}/model_{args.model_type}")
     print(f"장치: {args.device}")
     print(f"Epochs: {args.epochs}")
 

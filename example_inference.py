@@ -150,31 +150,31 @@ print(f"시퀀스 길이: {inferencer.seq_len}")
 
 
 # ============================================
-# 2. 예시 데이터 생성 (실제로는 CSV에서 로드)
+# 2. 데이터 로드 설정
 # ============================================
-# 실제 사용시: df = pd.read_csv("your_trajectory.csv")
-
-
 # 공통 필터 조건
-latlmt = [34.3, 35]
-lonlmt = [127 + 40/60, 128.5]
+latlmt = [33.3, 36]
+lonlmt = [126 + 40/60, 129.5]
 soglmt = [0, 25]
-length_range = [50, 400]
 
-
-
+# 데이터 조회용 시간 범위
 mmsi = 312454000
-start_time = '2018-01-01 10:17:02'
-end_time = '2018-01-02 23:27:20'	
+data_start_time = '2018-01-01 03:17:02'
+data_end_time = '2018-01-02 12:40:20'
 
+# 예측 구간 설정 (이 구간 내에서 10분마다 예측)
+predict_start_time = '2018-01-02 02:00:00'  # 예측 시작 시점
+predict_end_time = '2018-01-02 09:00:00'    # 예측 종료 시점
+predict_interval_min = 10                    # 예측 간격 (분)
+n_predict_steps = 30                         # 각 예측의 스텝 수 (분)
 
 # 항적 불러오기
 trj = load_trj(
     latlmt=latlmt,
     lonlmt=lonlmt,
     soglmt=soglmt,
-    datetimelmt=[start_time,end_time],
-    mmsi = mmsi
+    datetimelmt=[data_start_time, data_end_time],
+    mmsi=mmsi
 )
 
 print(f"\n원본 AIS 데이터: {len(trj)}개")
@@ -186,106 +186,218 @@ print(trj.head())
 # ============================================
 interpolated_full = interpolate_trajectory(trj)
 print(f"\n전체 보간 데이터: {len(interpolated_full)}개")
+print(f"데이터 범위: {interpolated_full['datetime'].iloc[0]} ~ {interpolated_full['datetime'].iloc[-1]}")
 
-# 예측 비교를 위해 n_steps 설정
-n_predict_steps = 30  # 예측할 스텝 수
 
-# 입력용 데이터: 마지막 n_predict_steps를 제외한 부분
-input_data = interpolated_full.iloc[:-n_predict_steps].copy()
-# 실제 정답 데이터: 마지막 n_predict_steps
-ground_truth = interpolated_full.iloc[-n_predict_steps:].copy()
-
-print(f"입력 데이터: {len(input_data)}개 (예측 시작점까지)")
-print(f"정답 데이터: {len(ground_truth)}개 (비교용)")
-
-# 입력 데이터 마지막 부분(모델이 보는 부분)의 SOG 확인
+# ============================================
+# 4. 10분 간격 다중 예측 수행
+# ============================================
+predict_start = pd.to_datetime(predict_start_time)
+predict_end = pd.to_datetime(predict_end_time)
 seq_len = inferencer.seq_len
-print(f"\n입력 데이터 마지막 {seq_len}개의 SOG 통계:")
-last_sog = input_data['sog'].iloc[-seq_len:]
-print(f"  평균: {last_sog.mean():.2f} knots")
-print(f"  최소: {last_sog.min():.2f} knots")
-print(f"  최대: {last_sog.max():.2f} knots")
-print(f"\n정답 데이터 SOG 통계:")
-print(f"  평균: {ground_truth['sog'].mean():.2f} knots")
-print(f"  최소: {ground_truth['sog'].min():.2f} knots")
-print(f"  최대: {ground_truth['sog'].max():.2f} knots")
 
+# 예측 시점 생성
+prediction_times = pd.date_range(start=predict_start, end=predict_end, freq=f'{predict_interval_min}min')
+print(f"\n예측 시점 수: {len(prediction_times)}개 ({predict_interval_min}분 간격)")
 
-# ============================================
-# 4. 예측 수행
-# ============================================
-preds = inferencer.predict_multi_from_df(
-    input_data,
-    n_steps=n_predict_steps,
-)
+# 각 시점별 예측 결과 저장
+all_predictions = []
 
-print("\n예측 결과:")
-print(preds.head(10))
+for pred_time in prediction_times:
+    # 예측 시점까지의 데이터 추출
+    input_data = interpolated_full[interpolated_full['datetime'] <= pred_time].copy()
 
-print(f"\n예측 SOG 통계:")
-print(f"  평균: {preds['pred_sog'].mean():.2f} knots")
-print(f"  최소: {preds['pred_sog'].min():.2f} knots")
-print(f"  최대: {preds['pred_sog'].max():.2f} knots")
+    # 시퀀스 길이보다 적으면 건너뜀
+    if len(input_data) < seq_len:
+        print(f"  [SKIP] {pred_time}: 데이터 부족 ({len(input_data)} < {seq_len})")
+        continue
+
+    # 예측 수행
+    try:
+        preds = inferencer.predict_multi_from_df(
+            input_data,
+            n_steps=n_predict_steps,
+        )
+
+        # 실제 경로 (Ground Truth) 추출
+        gt_start_idx = interpolated_full[interpolated_full['datetime'] == pred_time].index
+        if len(gt_start_idx) > 0:
+            gt_start = gt_start_idx[0]
+            gt_end = min(gt_start + n_predict_steps, len(interpolated_full))
+            ground_truth = interpolated_full.iloc[gt_start:gt_end].copy()
+        else:
+            ground_truth = None
+
+        all_predictions.append({
+            'pred_time': pred_time,
+            'predictions': preds,
+            'ground_truth': ground_truth,
+            'start_lat': input_data['lat'].iloc[-1],
+            'start_lon': input_data['lon'].iloc[-1],
+        })
+        print(f"  [OK] {pred_time.strftime('%Y-%m-%d %H:%M')}: 예측 완료")
+
+    except Exception as e:
+        print(f"  [ERROR] {pred_time}: {e}")
+
+print(f"\n총 예측 수행: {len(all_predictions)}개")
 
 
 # ============================================
 # 5. 결과 저장
 # ============================================
-preds.to_csv("prediction_result.csv", index=False, encoding='utf-8-sig')
-print("\n결과 저장: prediction_result.csv")
+# 모든 예측 결과를 하나의 CSV로 저장
+all_preds_df = []
+for item in all_predictions:
+    preds_df = item['predictions'].copy()
+    preds_df['pred_start_time'] = item['pred_time']
+    all_preds_df.append(preds_df)
+
+if all_preds_df:
+    combined_preds = pd.concat(all_preds_df, ignore_index=True)
+    combined_preds.to_csv("prediction_result.csv", index=False, encoding='utf-8-sig')
+    print(f"\n결과 저장: prediction_result.csv ({len(combined_preds)}행)")
 
 
 # ============================================
-# 6. 시각화: 원본 vs 예측 비교
+# 6. 시각화: Folium 지도 (클릭하면 예측 경로 표시)
 # ============================================
 try:
-    import matplotlib
-    matplotlib.use('Agg')  # 임시: 파일 저장만
-    import matplotlib.pyplot as plt
+    import folium
 
-    fig, ax = plt.subplots(1, 1, figsize=(12, 9))
+    # 지도 중심점: 마지막 예측의 종료점 기준
+    if all_predictions:
+        last_pred = all_predictions[-1]
+        center_lat = last_pred['predictions']['pred_lat'].iloc[-1]
+        center_lon = last_pred['predictions']['pred_lon'].iloc[-1]
+    else:
+        center_lat = interpolated_full['lat'].mean()
+        center_lon = interpolated_full['lon'].mean()
 
-    # 입력 데이터 (모델에 들어간 부분)
-    ax.plot(input_data['lon'], input_data['lat'], 'b-', label='Input (History)', linewidth=2, alpha=0.7)
+    # Folium 지도 생성
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=11,
+        tiles='CartoDB positron'
+    )
 
-    # 실제 정답 (Ground Truth)
-    ax.plot(ground_truth['lon'], ground_truth['lat'], 'g-', label='Ground Truth', linewidth=3)
-    ax.scatter(ground_truth['lon'].iloc[-1], ground_truth['lat'].iloc[-1],
-               c='green', s=200, marker='o', edgecolors='white', linewidths=2, zorder=5, label='GT End')
+    # 1. 전체 실제 항적 (파란색 실선)
+    full_coords = list(zip(interpolated_full['lat'], interpolated_full['lon']))
+    folium.PolyLine(
+        full_coords,
+        color='blue',
+        weight=2,
+        opacity=0.5,
+        popup='실제 전체 항적'
+    ).add_to(m)
 
-    # 예측 결과
-    ax.plot(preds['pred_lon'], preds['pred_lat'], 'r--', label='Predicted', linewidth=2)
-    ax.scatter(preds['pred_lon'].iloc[-1], preds['pred_lat'].iloc[-1],
-               c='red', s=200, marker='*', edgecolors='white', linewidths=1, zorder=5, label='Pred End')
+    # 2. 각 예측 시점별 마커와 예측 경로
+    colors = ['red', 'orange', 'purple', 'darkred', 'cadetblue', 'darkgreen', 'pink', 'darkblue']
 
-    # 예측 시작점 표시
-    ax.scatter(input_data['lon'].iloc[-1], input_data['lat'].iloc[-1],
-               c='blue', s=150, marker='s', edgecolors='white', linewidths=2, zorder=5, label='Prediction Start')
+    for idx, item in enumerate(all_predictions):
+        pred_time = item['pred_time']
+        preds = item['predictions']
+        gt = item['ground_truth']
+        color = colors[idx % len(colors)]
 
-    # 시간 라벨 표시 (5스텝 간격으로)
-    label_interval = 5
-    for i in range(0, len(ground_truth), label_interval):
-        time_str = ground_truth['datetime'].iloc[i].strftime('%H:%M')
-        ax.annotate(time_str,
-                    (ground_truth['lon'].iloc[i], ground_truth['lat'].iloc[i]),
-                    textcoords="offset points", xytext=(5, 5), fontsize=8, color='green')
+        time_str = pred_time.strftime('%Y-%m-%d %H:%M')
 
-    for i in range(0, len(preds), label_interval):
-        time_str = preds['datetime'].iloc[i].strftime('%H:%M')
-        ax.annotate(time_str,
-                    (preds['pred_lon'].iloc[i], preds['pred_lat'].iloc[i]),
-                    textcoords="offset points", xytext=(5, -10), fontsize=8, color='red')
+        # 예측 시작점 마커 (클릭하면 예측 경로 표시)
+        # FeatureGroup으로 예측 경로를 감싸서 토글 가능하게
+        fg = folium.FeatureGroup(name=f"예측 {time_str}", show=False)
 
-    ax.set_xlabel('Longitude')
-    ax.set_ylabel('Latitude')
-    ax.set_title(f'Trajectory Prediction vs Ground Truth ({n_predict_steps} steps)')
-    ax.legend(loc='best')
-    ax.grid(True)
+        # 예측 경로 (점선)
+        pred_coords = [(item['start_lat'], item['start_lon'])] + list(zip(preds['pred_lat'], preds['pred_lon']))
+        folium.PolyLine(
+            pred_coords,
+            color=color,
+            weight=3,
+            opacity=0.8,
+            dash_array='5',
+        ).add_to(fg)
 
-    plt.tight_layout()
-    plt.savefig('prediction_comparison.png', dpi=150)
-    print("시각화 저장: prediction_comparison.png")
-    plt.close()
+        # 실제 경로 (GT, 실선)
+        if gt is not None and len(gt) > 0:
+            gt_coords = list(zip(gt['lat'], gt['lon']))
+            folium.PolyLine(
+                gt_coords,
+                color='green',
+                weight=3,
+                opacity=0.8,
+            ).add_to(fg)
+
+            # GT 종료점
+            folium.CircleMarker(
+                [gt['lat'].iloc[-1], gt['lon'].iloc[-1]],
+                radius=6,
+                color='green',
+                fill=True,
+                fill_opacity=0.8,
+                popup=f"실제 종료<br>{gt['datetime'].iloc[-1].strftime('%H:%M')}"
+            ).add_to(fg)
+
+        # 예측 종료점
+        folium.CircleMarker(
+            [preds['pred_lat'].iloc[-1], preds['pred_lon'].iloc[-1]],
+            radius=6,
+            color=color,
+            fill=True,
+            fill_opacity=0.8,
+            popup=f"예측 종료<br>SOG: {preds['pred_sog'].iloc[-1]:.1f} kts<br>COG: {preds['pred_cog'].iloc[-1]:.1f}°"
+        ).add_to(fg)
+
+        # 5분 간격 포인트
+        for i in range(0, len(preds), 5):
+            row = preds.iloc[i]
+            folium.CircleMarker(
+                [row['pred_lat'], row['pred_lon']],
+                radius=3,
+                color=color,
+                fill=True,
+                popup=f"+{i}분<br>SOG: {row['pred_sog']:.1f}<br>COG: {row['pred_cog']:.1f}°"
+            ).add_to(fg)
+
+        fg.add_to(m)
+
+        # 예측 시작점 마커 (항상 표시)
+        popup_html = f"""
+        <b>예측 시점: {time_str}</b><br>
+        위치: ({item['start_lat']:.4f}, {item['start_lon']:.4f})<br>
+        예측 {n_predict_steps}분<br>
+        <i>좌측 레이어 패널에서 "{time_str}" 클릭하여 경로 표시</i>
+        """
+        folium.Marker(
+            [item['start_lat'], item['start_lon']],
+            popup=folium.Popup(popup_html, max_width=250),
+            icon=folium.Icon(color='blue', icon='circle', prefix='fa'),
+        ).add_to(m)
+
+    # 범례 추가
+    legend_html = f'''
+    <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000;
+                background-color: white; padding: 10px; border-radius: 5px;
+                border: 2px solid grey; font-size: 12px;">
+        <b>범례</b><br>
+        <i style="background: blue; width: 20px; height: 2px; display: inline-block;"></i> 실제 전체 항적<br>
+        <i style="background: green; width: 20px; height: 3px; display: inline-block;"></i> 실제 경로 (GT)<br>
+        <i style="border-top: 2px dashed red; width: 20px; display: inline-block;"></i> 예측 경로<br>
+        <br>
+        <b>설정</b><br>
+        예측 간격: {predict_interval_min}분<br>
+        예측 길이: {n_predict_steps}분<br>
+        총 예측: {len(all_predictions)}개
+    </div>
+    '''
+    m.get_root().html.add_child(folium.Element(legend_html))
+
+    # 레이어 컨트롤 추가 (예측 경로 토글)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    # 저장
+    output_html = 'prediction_map.html'
+    m.save(output_html)
+    print(f"\nFolium 지도 저장: {output_html}")
+    print("※ 좌측 레이어 패널에서 각 예측 시점을 클릭하면 해당 예측 경로가 표시됩니다.")
 
 except ImportError:
-    print("\n[INFO] matplotlib가 없어 시각화 생략")
+    print("\n[INFO] folium이 없어 지도 시각화 생략. pip install folium 으로 설치하세요.")

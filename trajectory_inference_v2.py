@@ -3,8 +3,10 @@
 선박 항적 예측 추론 V2
 ========================
 Categorical 변수 및 격자 ID 지원
++ 해역 경계 마스크 적용 (육지 이탈 방지)
 """
 
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -81,13 +83,133 @@ def compute_grid_id(lat, lon, lat_min, lon_min, grid_size, num_cols):
     return grid_row * num_cols + grid_col
 
 
-class TrajectoryInferenceV2:
-    """V2 추론 클래스 (Categorical + Grid 지원)"""
+def load_sea_boundary(boundary_path):
+    """해역 경계 데이터 로드"""
+    if not os.path.exists(boundary_path):
+        return None
 
-    def __init__(self, model_path, scaler_path, seq_len=None, device=None):
+    data = np.load(boundary_path, allow_pickle=True)
+
+    sea_mask = {
+        'valid_mask': data['valid_mask'],
+        'lat_min': float(data['mask_lat_min']),
+        'lat_max': float(data['mask_lat_max']),
+        'lon_min': float(data['mask_lon_min']),
+        'lon_max': float(data['mask_lon_max']),
+        'grid_size': float(data['mask_grid_size']),
+        'num_rows': int(data['mask_num_rows']),
+        'num_cols': int(data['mask_num_cols']),
+    }
+
+    route_info = {
+        'density_grid': data['density_grid'],
+        'high_density_mask': data['high_density_mask'],
+        'lat_min': float(data['route_lat_min']),
+        'lat_max': float(data['route_lat_max']),
+        'lon_min': float(data['route_lon_min']),
+        'lon_max': float(data['route_lon_max']),
+        'grid_size': float(data['route_grid_size']),
+    }
+
+    return {'sea_mask': sea_mask, 'routes': route_info}
+
+
+def is_valid_sea_position(lat, lon, sea_mask):
+    """위치가 유효 해역인지 확인"""
+    if sea_mask is None:
+        return True
+
+    row = int((lat - sea_mask['lat_min']) / sea_mask['grid_size'])
+    col = int((lon - sea_mask['lon_min']) / sea_mask['grid_size'])
+
+    if 0 <= row < sea_mask['num_rows'] and 0 <= col < sea_mask['num_cols']:
+        return bool(sea_mask['valid_mask'][row, col])
+    return False
+
+
+def find_nearest_valid_position(lat, lon, prev_lat, prev_lon, sea_mask, max_search_radius=20):
+    """
+    가장 가까운 유효 해역 위치 찾기
+
+    전략:
+    1. 현재 위치가 유효하면 그대로 반환
+    2. 유효하지 않으면 이전 위치와 현재 위치 사이에서 유효한 지점 찾기
+    3. 그래도 없으면 나선형으로 주변 검색
+    4. 최후의 수단으로 이전 위치 반환
+    """
+    if sea_mask is None:
+        return lat, lon
+
+    # 이미 유효하면 그대로
+    if is_valid_sea_position(lat, lon, sea_mask):
+        return lat, lon
+
+    grid_size = sea_mask['grid_size']
+
+    # 전략 1: 이전 위치와 현재 위치 사이에서 유효한 지점 찾기 (이진 탐색)
+    for ratio in [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]:
+        mid_lat = prev_lat + (lat - prev_lat) * ratio
+        mid_lon = prev_lon + (lon - prev_lon) * ratio
+        if is_valid_sea_position(mid_lat, mid_lon, sea_mask):
+            return mid_lat, mid_lon
+
+    # 전략 2: 나선형으로 주변 검색
+    row = int((lat - sea_mask['lat_min']) / grid_size)
+    col = int((lon - sea_mask['lon_min']) / grid_size)
+
+    for radius in range(1, max_search_radius + 1):
+        for dr in range(-radius, radius + 1):
+            for dc in range(-radius, radius + 1):
+                if abs(dr) != radius and abs(dc) != radius:
+                    continue
+
+                nr, nc = row + dr, col + dc
+                if 0 <= nr < sea_mask['num_rows'] and 0 <= nc < sea_mask['num_cols']:
+                    if sea_mask['valid_mask'][nr, nc]:
+                        new_lat = sea_mask['lat_min'] + (nr + 0.5) * grid_size
+                        new_lon = sea_mask['lon_min'] + (nc + 0.5) * grid_size
+                        return new_lat, new_lon
+
+    # 전략 3: 이전 위치가 유효하면 이전 위치 반환
+    if is_valid_sea_position(prev_lat, prev_lon, sea_mask):
+        return prev_lat, prev_lon
+
+    # 최후: 원래 위치 그대로 (경고만)
+    return lat, lon
+
+
+class TrajectoryInferenceV2:
+    """V2 추론 클래스 (Categorical + Grid 지원 + 해역 경계)"""
+
+    def __init__(self, model_path, scaler_path, seq_len=None, device=None, boundary_path=None):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
+
+        # 해역 경계 로드 (자동 탐색)
+        if boundary_path is None:
+            # scaler와 같은 폴더 또는 prepared_data 폴더에서 탐색
+            scaler_dir = os.path.dirname(scaler_path)
+            candidates = [
+                os.path.join(scaler_dir, "sea_boundary.npz"),
+                os.path.join(scaler_dir, "..", "sea_boundary.npz"),
+                "prepared_data/sea_boundary.npz",
+                "sea_boundary.npz",
+            ]
+            for cand in candidates:
+                if os.path.exists(cand):
+                    boundary_path = cand
+                    break
+
+        self.boundary_data = None
+        self.sea_mask = None
+        if boundary_path and os.path.exists(boundary_path):
+            self.boundary_data = load_sea_boundary(boundary_path)
+            if self.boundary_data:
+                self.sea_mask = self.boundary_data['sea_mask']
+                print(f"[InferenceV2] 해역 경계 로드: {boundary_path}")
+                valid_count = np.sum(self.sea_mask['valid_mask'])
+                print(f"[InferenceV2] 유효 해역 격자: {valid_count:,} 개")
 
         ckpt = np.load(scaler_path, allow_pickle=True)
 
@@ -137,7 +259,7 @@ class TrajectoryInferenceV2:
             self.lat_bounds = None
             self.lon_bounds = None
 
-        print(f"[InferenceV2] seq_len={self.seq_len}, dt_minutes={self.dt_minutes}")
+        print(f"[InferenceV2] seq_len={self.seq_len}")
         print(f"[InferenceV2] 격자: {self.num_rows}x{self.num_cols} = {self.total_grids} (크기: {self.grid_size}도)")
         print(f"[InferenceV2] Categorical: mmsi={num_mmsi}, start_area={num_start_area}, end_area={num_end_area}")
 
@@ -237,7 +359,8 @@ class TrajectoryInferenceV2:
                               sog_clip=(0.0, 35.0),
                               sog_min_ratio=0.7,
                               use_model_latlon=False,
-                              enforce_bounds=True):
+                              enforce_bounds=True,
+                              enforce_sea_boundary=True):
         """
         다중 스텝 예측 (1분 간격)
 
@@ -248,6 +371,7 @@ class TrajectoryInferenceV2:
         mmsi, start_area, end_area: Categorical 값 (None이면 df에서 추출)
         sog_clip: SOG 클리핑 범위 (min, max)
         sog_min_ratio: 입력 데이터 평균 SOG 대비 최소 비율 (0.7 = 70% 이상 유지)
+        enforce_sea_boundary: 해역 경계 적용 여부 (True: 육지 이탈 시 보정)
         """
 
         hist = self._prepare_hist(df, mmsi, start_area, end_area)
@@ -276,6 +400,7 @@ class TrajectoryInferenceV2:
 
         preds = []
         bound_violations = 0
+        sea_boundary_corrections = 0
 
         for _ in range(int(n_steps)):
             x_num_t = torch.from_numpy(Xn_num).unsqueeze(0).to(self.device)
@@ -304,6 +429,15 @@ class TrajectoryInferenceV2:
                 if violated:
                     bound_violations += 1
 
+            # 해역 경계 적용: 육지로 예측되면 가장 가까운 유효 해역으로 보정
+            if enforce_sea_boundary and self.sea_mask is not None:
+                if not is_valid_sea_position(next_lat, next_lon, self.sea_mask):
+                    corrected_lat, corrected_lon = find_nearest_valid_position(
+                        next_lat, next_lon, cur_lat, cur_lon, self.sea_mask
+                    )
+                    next_lat, next_lon = corrected_lat, corrected_lon
+                    sea_boundary_corrections += 1
+
             last_time = last_time + pd.Timedelta(minutes=1)
             preds.append([last_time, next_lat, next_lon, pred_sog, pred_cog])
 
@@ -327,6 +461,8 @@ class TrajectoryInferenceV2:
 
         if bound_violations > 0:
             print(f"[InferenceV2] 경고: {bound_violations}회 항로 범위 이탈 보정됨")
+        if sea_boundary_corrections > 0:
+            print(f"[InferenceV2] 경고: {sea_boundary_corrections}회 육지 이탈 보정됨 (해역 경계 적용)")
 
         return pd.DataFrame(preds, columns=["datetime","pred_lat","pred_lon","pred_sog","pred_cog"])
 
