@@ -13,7 +13,7 @@ from load_trj import load_trj
 
 import pandas as pd
 import numpy as np
-from trajectory_inference_v2 import TrajectoryInferenceV2
+from trajectory_inference_v2 import TrajectoryInferenceV2, TrajectoryInferenceV3
 
 
 def interpolate_trajectory(trj, dt_minutes=1, datetime_col='datetime',
@@ -140,13 +140,16 @@ def interpolate_and_predict(trj, inferencer, n_steps=30,
 
 
 # ============================================
-# 1. 추론기 로드
+# 1. 추론기 로드 (V3 TFT 모델)
 # ============================================
-model_path = "global_model_v2/lstm_global_v2.pth"
-scaler_path = "global_model_v2/scaler_global_v2.npz"
+# V2 모델: LSTM+Attention
+model_path_tft = "model/yeosu/model_lstm_attn/model_lstm_attn.pth"
+scaler_path_tft = "model/yeosu/model_lstm_attn/scaler_lstm_attn.npz"
 
-inferencer = TrajectoryInferenceV2(model_path, scaler_path)
-print(f"시퀀스 길이: {inferencer.seq_len}")
+# V2 추론기 생성
+inferencer_tft = TrajectoryInferenceV2(model_path_tft, scaler_path_tft)
+
+print(f"TFT V3 시퀀스 길이: {inferencer_tft.seq_len}")
 
 
 # ============================================
@@ -157,14 +160,16 @@ latlmt = [33.3, 36]
 lonlmt = [126 + 40/60, 129.5]
 soglmt = [0, 25]
 
+#259788000_동쪽진입_여수정박지B_20180602081318_20180602130243
+
 # 데이터 조회용 시간 범위
-mmsi = 312454000
-data_start_time = '2018-01-01 03:17:02'
-data_end_time = '2018-01-02 12:40:20'
+mmsi = 259788000
+data_start_time = '2018-06-02 07:17:02'
+data_end_time = '2018-06-02 16:40:20'
 
 # 예측 구간 설정 (이 구간 내에서 10분마다 예측)
-predict_start_time = '2018-01-02 02:00:00'  # 예측 시작 시점
-predict_end_time = '2018-01-02 09:00:00'    # 예측 종료 시점
+predict_start_time ='2018-06-02 09:17:02'  # 예측 시작 시점
+predict_end_time = '2018-06-02 12:40:20'   # 예측 종료 시점
 predict_interval_min = 10                    # 예측 간격 (분)
 n_predict_steps = 30                         # 각 예측의 스텝 수 (분)
 
@@ -190,18 +195,18 @@ print(f"데이터 범위: {interpolated_full['datetime'].iloc[0]} ~ {interpolate
 
 
 # ============================================
-# 4. 10분 간격 다중 예측 수행
+# 4. 10분 간격 다중 예측 수행 (TFT V3 모델)
 # ============================================
 predict_start = pd.to_datetime(predict_start_time)
 predict_end = pd.to_datetime(predict_end_time)
-seq_len = inferencer.seq_len
+seq_len = inferencer_tft.seq_len
 
 # 예측 시점 생성
 prediction_times = pd.date_range(start=predict_start, end=predict_end, freq=f'{predict_interval_min}min')
 print(f"\n예측 시점 수: {len(prediction_times)}개 ({predict_interval_min}분 간격)")
 
 # 각 시점별 예측 결과 저장
-all_predictions = []
+all_predictions_tft = []
 
 for pred_time in prediction_times:
     # 예측 시점까지의 데이터 추출
@@ -212,62 +217,65 @@ for pred_time in prediction_times:
         print(f"  [SKIP] {pred_time}: 데이터 부족 ({len(input_data)} < {seq_len})")
         continue
 
-    # 예측 수행
+    # 실제 경로 (Ground Truth) 추출
+    gt_start_idx = interpolated_full[interpolated_full['datetime'] == pred_time].index
+    if len(gt_start_idx) > 0:
+        gt_start = gt_start_idx[0]
+        gt_end = min(gt_start + n_predict_steps, len(interpolated_full))
+        ground_truth = interpolated_full.iloc[gt_start:gt_end].copy()
+    else:
+        ground_truth = None
+
+    start_lat = input_data['lat'].iloc[-1]
+    start_lon = input_data['lon'].iloc[-1]
+
+    # TFT V3 예측 (V3는 속도 벡터 사용으로 heading_inertia 불필요)
     try:
-        preds = inferencer.predict_multi_from_df(
+        preds_tft = inferencer_tft.predict_multi_from_df(
             input_data,
             n_steps=n_predict_steps,
+            start_area="남쪽 진입",  # 필요시 수정
+            end_area="여수정박지B",   # 필요시 수정
         )
-
-        # 실제 경로 (Ground Truth) 추출
-        gt_start_idx = interpolated_full[interpolated_full['datetime'] == pred_time].index
-        if len(gt_start_idx) > 0:
-            gt_start = gt_start_idx[0]
-            gt_end = min(gt_start + n_predict_steps, len(interpolated_full))
-            ground_truth = interpolated_full.iloc[gt_start:gt_end].copy()
-        else:
-            ground_truth = None
-
-        all_predictions.append({
+        all_predictions_tft.append({
             'pred_time': pred_time,
-            'predictions': preds,
+            'predictions': preds_tft,
             'ground_truth': ground_truth,
-            'start_lat': input_data['lat'].iloc[-1],
-            'start_lon': input_data['lon'].iloc[-1],
+            'start_lat': start_lat,
+            'start_lon': start_lon,
         })
-        print(f"  [OK] {pred_time.strftime('%Y-%m-%d %H:%M')}: 예측 완료")
-
+        print(f"  [TFT V3] {pred_time.strftime('%Y-%m-%d %H:%M')}: 예측 완료")
     except Exception as e:
-        print(f"  [ERROR] {pred_time}: {e}")
+        print(f"  [TFT V3 ERROR] {pred_time}: {e}")
 
-print(f"\n총 예측 수행: {len(all_predictions)}개")
+print(f"\n총 예측 수행: TFT V3 {len(all_predictions_tft)}개")
 
 
 # ============================================
-# 5. 결과 저장
+# 5. 결과 저장 (TFT V3 모델)
 # ============================================
-# 모든 예측 결과를 하나의 CSV로 저장
-all_preds_df = []
-for item in all_predictions:
+all_preds_tft_df = []
+for item in all_predictions_tft:
     preds_df = item['predictions'].copy()
     preds_df['pred_start_time'] = item['pred_time']
-    all_preds_df.append(preds_df)
+    preds_df['model'] = 'TFT_V3'
+    all_preds_tft_df.append(preds_df)
 
-if all_preds_df:
-    combined_preds = pd.concat(all_preds_df, ignore_index=True)
+if all_preds_tft_df:
+    combined_preds = pd.concat(all_preds_tft_df, ignore_index=True)
     combined_preds.to_csv("prediction_result.csv", index=False, encoding='utf-8-sig')
     print(f"\n결과 저장: prediction_result.csv ({len(combined_preds)}행)")
 
 
 # ============================================
-# 6. 시각화: Folium 지도 (클릭하면 예측 경로 표시)
+# 6. 시각화: Folium 지도 (TFT V3 모델)
 # ============================================
 try:
     import folium
 
     # 지도 중심점: 마지막 예측의 종료점 기준
-    if all_predictions:
-        last_pred = all_predictions[-1]
+    if all_predictions_tft:
+        last_pred = all_predictions_tft[-1]
         center_lat = last_pred['predictions']['pred_lat'].iloc[-1]
         center_lon = last_pred['predictions']['pred_lon'].iloc[-1]
     else:
@@ -291,32 +299,19 @@ try:
         popup='실제 전체 항적'
     ).add_to(m)
 
-    # 2. 각 예측 시점별 마커와 예측 경로
-    colors = ['red', 'orange', 'purple', 'darkred', 'cadetblue', 'darkgreen', 'pink', 'darkblue']
-
-    for idx, item in enumerate(all_predictions):
+    # 2. 각 예측 시점별 TFT V3 예측 경로 표시
+    for item in all_predictions_tft:
         pred_time = item['pred_time']
-        preds = item['predictions']
-        gt = item['ground_truth']
-        color = colors[idx % len(colors)]
-
         time_str = pred_time.strftime('%Y-%m-%d %H:%M')
+        preds_tft = item['predictions']
+        gt = item['ground_truth']
+        start_lat = item['start_lat']
+        start_lon = item['start_lon']
 
-        # 예측 시작점 마커 (클릭하면 예측 경로 표시)
-        # FeatureGroup으로 예측 경로를 감싸서 토글 가능하게
+        # FeatureGroup으로 해당 시점의 예측 묶기
         fg = folium.FeatureGroup(name=f"예측 {time_str}", show=False)
 
-        # 예측 경로 (점선)
-        pred_coords = [(item['start_lat'], item['start_lon'])] + list(zip(preds['pred_lat'], preds['pred_lon']))
-        folium.PolyLine(
-            pred_coords,
-            color=color,
-            weight=3,
-            opacity=0.8,
-            dash_array='5',
-        ).add_to(fg)
-
-        # 실제 경로 (GT, 실선)
+        # 실제 경로 (GT, 녹색 실선)
         if gt is not None and len(gt) > 0:
             gt_coords = list(zip(gt['lat'], gt['lon']))
             folium.PolyLine(
@@ -336,25 +331,35 @@ try:
                 popup=f"실제 종료<br>{gt['datetime'].iloc[-1].strftime('%H:%M')}"
             ).add_to(fg)
 
-        # 예측 종료점
-        folium.CircleMarker(
-            [preds['pred_lat'].iloc[-1], preds['pred_lon'].iloc[-1]],
-            radius=6,
-            color=color,
-            fill=True,
-            fill_opacity=0.8,
-            popup=f"예측 종료<br>SOG: {preds['pred_sog'].iloc[-1]:.1f} kts<br>COG: {preds['pred_cog'].iloc[-1]:.1f}°"
+        # TFT V3 예측 경로 (보라색 점선)
+        pred_coords_tft = [(start_lat, start_lon)] + list(zip(preds_tft['pred_lat'], preds_tft['pred_lon']))
+        folium.PolyLine(
+            pred_coords_tft,
+            color='purple',
+            weight=3,
+            opacity=0.8,
+            dash_array='10',
         ).add_to(fg)
 
-        # 5분 간격 포인트
-        for i in range(0, len(preds), 5):
-            row = preds.iloc[i]
+        # TFT 종료점
+        folium.CircleMarker(
+            [preds_tft['pred_lat'].iloc[-1], preds_tft['pred_lon'].iloc[-1]],
+            radius=6,
+            color='purple',
+            fill=True,
+            fill_opacity=0.8,
+            popup=f"TFT V3 종료<br>SOG: {preds_tft['pred_sog'].iloc[-1]:.1f} kts<br>COG: {preds_tft['pred_cog'].iloc[-1]:.1f}°"
+        ).add_to(fg)
+
+        # TFT 5분 간격 포인트
+        for i in range(0, len(preds_tft), 5):
+            row = preds_tft.iloc[i]
             folium.CircleMarker(
                 [row['pred_lat'], row['pred_lon']],
                 radius=3,
-                color=color,
+                color='purple',
                 fill=True,
-                popup=f"+{i}분<br>SOG: {row['pred_sog']:.1f}<br>COG: {row['pred_cog']:.1f}°"
+                popup=f"TFT V3 +{i}분<br>SOG: {row['pred_sog']:.1f}<br>COG: {row['pred_cog']:.1f}°"
             ).add_to(fg)
 
         fg.add_to(m)
@@ -362,12 +367,13 @@ try:
         # 예측 시작점 마커 (항상 표시)
         popup_html = f"""
         <b>예측 시점: {time_str}</b><br>
-        위치: ({item['start_lat']:.4f}, {item['start_lon']:.4f})<br>
+        위치: ({start_lat:.4f}, {start_lon:.4f})<br>
         예측 {n_predict_steps}분<br>
-        <i>좌측 레이어 패널에서 "{time_str}" 클릭하여 경로 표시</i>
+        <span style="color:purple">■</span> TFT V3 (속도 벡터 기반)<br>
+        <i>좌측 레이어 패널에서 클릭하여 경로 표시</i>
         """
         folium.Marker(
-            [item['start_lat'], item['start_lon']],
+            [start_lat, start_lon],
             popup=folium.Popup(popup_html, max_width=250),
             icon=folium.Icon(color='blue', icon='circle', prefix='fa'),
         ).add_to(m)
@@ -380,12 +386,12 @@ try:
         <b>범례</b><br>
         <i style="background: blue; width: 20px; height: 2px; display: inline-block;"></i> 실제 전체 항적<br>
         <i style="background: green; width: 20px; height: 3px; display: inline-block;"></i> 실제 경로 (GT)<br>
-        <i style="border-top: 2px dashed red; width: 20px; display: inline-block;"></i> 예측 경로<br>
+        <i style="border-top: 2px dashed purple; width: 20px; display: inline-block;"></i> TFT V3 예측<br>
         <br>
         <b>설정</b><br>
         예측 간격: {predict_interval_min}분<br>
         예측 길이: {n_predict_steps}분<br>
-        총 예측: {len(all_predictions)}개
+        TFT V3 예측: {len(all_predictions_tft)}개
     </div>
     '''
     m.get_root().html.add_child(folium.Element(legend_html))
@@ -398,6 +404,7 @@ try:
     m.save(output_html)
     print(f"\nFolium 지도 저장: {output_html}")
     print("※ 좌측 레이어 패널에서 각 예측 시점을 클릭하면 해당 예측 경로가 표시됩니다.")
+    print("  - 보라색: TFT V3 모델 (속도 벡터 기반)")
 
 except ImportError:
     print("\n[INFO] folium이 없어 지도 시각화 생략. pip install folium 으로 설치하세요.")

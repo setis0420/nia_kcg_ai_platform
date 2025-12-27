@@ -1,11 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-전처리된 데이터로 모델 학습
-============================
+전처리된 데이터로 모델 학습 - V3
+================================
 prepare_data.py로 생성된 npz 파일을 로드하여 학습
 
+V3 변경사항:
+- 수치형 입력: lat, lon, vx, vy (4개) - sog/sin_cog/cos_cog 대신 속도벡터
+- 범주형 입력: start_area, end_area, grid_id (3개) - mmsi 제거
+- 출력: lat, lon, vx, vy (4개)
+
 사용법:
-    python train_model.py --data_dir "prepared_data" \
+    python train_model.py --data_dir "prepared_data_v3" \
                           --epochs 300 \
                           --device cuda
 """
@@ -67,6 +72,11 @@ class TrajectoryDatasetGPU(Dataset):
         # 시퀀스 인덱스 생성: [n_samples, seq_len]
         seq_offsets = torch.arange(seq_len, device=device).unsqueeze(0)  # [1, seq_len]
         all_indices = indices_t.unsqueeze(1) + seq_offsets  # [n_samples, seq_len]
+
+        # 인덱스 범위 검증
+        max_idx = all_indices.max().item()
+        if max_idx >= X_cat_t.shape[0]:
+            raise ValueError(f"Index out of bounds: max_idx={max_idx}, X_cat_t.shape[0]={X_cat_t.shape[0]}")
 
         # 미리 시퀀스 데이터 구성
         self.X_num = Xn_num_t[all_indices]  # [n_samples, seq_len, num_features]
@@ -177,15 +187,14 @@ class ChunkedTrainer:
         return total
 
 
-class LSTMTrajectoryModelV2(nn.Module):
-    """LSTM 모델 (Embedding + LSTM)"""
+class LSTMTrajectoryModelV3(nn.Module):
+    """LSTM 모델 V3 (Embedding + LSTM) - mmsi 제거, Vx/Vy 사용"""
     def __init__(self,
-                 num_features=5,
+                 num_features=4,  # V3: lat, lon, vx, vy
                  hidden_dim=128,
                  num_layers=2,
-                 output_dim=5,
+                 output_dim=4,   # V3: lat, lon, vx, vy
                  dropout=0.2,
-                 num_mmsi=1000,
                  num_start_area=50,
                  num_end_area=50,
                  num_grids=10000,
@@ -195,12 +204,12 @@ class LSTMTrajectoryModelV2(nn.Module):
         self.num_features = num_features
         self.embed_dim = embed_dim
 
-        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        # V3: mmsi 제거, 3개 범주형만 사용
         self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
         self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
         self.grid_embed = nn.Embedding(num_grids, embed_dim)
 
-        lstm_input_dim = num_features + 4 * embed_dim
+        lstm_input_dim = num_features + 3 * embed_dim  # 3개 임베딩
 
         self.lstm = nn.LSTM(lstm_input_dim, hidden_dim, num_layers,
                            batch_first=True, dropout=dropout)
@@ -209,12 +218,12 @@ class LSTMTrajectoryModelV2(nn.Module):
     def forward(self, x_num, x_cat):
         B, T, _ = x_num.shape
 
-        mmsi_emb = self.mmsi_embed(x_cat[:, :, 0])
-        start_emb = self.start_area_embed(x_cat[:, :, 1])
-        end_emb = self.end_area_embed(x_cat[:, :, 2])
-        grid_emb = self.grid_embed(x_cat[:, :, 3])
+        # V3: x_cat = [start_area, end_area, grid_id] (3개)
+        start_emb = self.start_area_embed(x_cat[:, :, 0])
+        end_emb = self.end_area_embed(x_cat[:, :, 1])
+        grid_emb = self.grid_embed(x_cat[:, :, 2])
 
-        x = torch.cat([x_num, mmsi_emb, start_emb, end_emb, grid_emb], dim=-1)
+        x = torch.cat([x_num, start_emb, end_emb, grid_emb], dim=-1)
         out, _ = self.lstm(x)
 
         return self.fc(out[:, -1, :])
@@ -396,9 +405,10 @@ class InterpretableMultiHeadAttention(nn.Module):
         return output, attn_weights
 
 
-class TemporalFusionTransformer(nn.Module):
+class TemporalFusionTransformerV3(nn.Module):
     """
-    Temporal Fusion Transformer (TFT) for Ship Trajectory Prediction
+    Temporal Fusion Transformer V3 for Ship Trajectory Prediction
+    - mmsi 제거, Vx/Vy 속도 벡터 사용
 
     구조:
     1. Embedding Layer: 수치형 + 범주형 변수 임베딩
@@ -409,12 +419,11 @@ class TemporalFusionTransformer(nn.Module):
     6. Output Layer: 예측값 생성
     """
     def __init__(self,
-                 num_features=5,
+                 num_features=4,  # V3: lat, lon, vx, vy
                  hidden_dim=128,
-                 output_dim=5,
+                 output_dim=4,    # V3: lat, lon, vx, vy
                  n_heads=4,
                  dropout=0.1,
-                 num_mmsi=1000,
                  num_start_area=50,
                  num_end_area=50,
                  num_grids=10000,
@@ -430,8 +439,7 @@ class TemporalFusionTransformer(nn.Module):
         # ===================
         # 1. Embedding Layers
         # ===================
-        # 범주형 임베딩
-        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        # V3: 범주형 임베딩 (mmsi 제거)
         self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
         self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
         self.grid_embed = nn.Embedding(num_grids, embed_dim)
@@ -441,15 +449,15 @@ class TemporalFusionTransformer(nn.Module):
             nn.Linear(1, hidden_dim) for _ in range(num_features)
         ])
 
-        # 범주형 변수 투영
+        # V3: 범주형 변수 투영 (3개: start, end, grid)
         self.cat_projections = nn.ModuleList([
-            nn.Linear(embed_dim, hidden_dim) for _ in range(4)  # mmsi, start, end, grid
+            nn.Linear(embed_dim, hidden_dim) for _ in range(3)
         ])
 
         # ===================
         # 2. Variable Selection
         # ===================
-        total_vars = num_features + 4  # 5 numeric + 4 categorical
+        total_vars = num_features + 3  # V3: 4 numeric + 3 categorical
         self.var_selection = VariableSelectionNetwork(
             input_dim=hidden_dim,
             num_inputs=total_vars,
@@ -517,10 +525,23 @@ class TemporalFusionTransformer(nn.Module):
 
     def forward(self, x_num, x_cat):
         """
-        x_num: [B, T, 5] - 수치형 (lat, lon, sog, sin_cog, cos_cog)
-        x_cat: [B, T, 4] - 범주형 (mmsi_idx, start_idx, end_idx, grid_id)
+        V3:
+        x_num: [B, T, 4] - 수치형 (lat, lon, vx, vy)
+        x_cat: [B, T, 3] - 범주형 (start_idx, end_idx, grid_id)
         """
         B, T, _ = x_num.shape
+
+        # 디버깅: 범주형 인덱스 검증
+        start_max = x_cat[:, :, 0].max().item()
+        end_max = x_cat[:, :, 1].max().item()
+        grid_max = x_cat[:, :, 2].max().item()
+
+        if start_max >= self.start_area_embed.num_embeddings:
+            raise ValueError(f"start_area index {start_max} >= embedding size {self.start_area_embed.num_embeddings}")
+        if end_max >= self.end_area_embed.num_embeddings:
+            raise ValueError(f"end_area index {end_max} >= embedding size {self.end_area_embed.num_embeddings}")
+        if grid_max >= self.grid_embed.num_embeddings:
+            raise ValueError(f"grid index {grid_max} >= embedding size {self.grid_embed.num_embeddings}")
 
         # ===================
         # 1. Embedding
@@ -532,18 +553,17 @@ class TemporalFusionTransformer(nn.Module):
             projected = self.numeric_projections[i](var)  # [B, T, hidden_dim]
             numeric_vars.append(projected)
 
-        # 범주형 임베딩 + 투영
-        mmsi_emb = self.cat_projections[0](self.mmsi_embed(x_cat[:, :, 0]))
-        start_emb = self.cat_projections[1](self.start_area_embed(x_cat[:, :, 1]))
-        end_emb = self.cat_projections[2](self.end_area_embed(x_cat[:, :, 2]))
-        grid_emb = self.cat_projections[3](self.grid_embed(x_cat[:, :, 3]))
+        # V3: 범주형 임베딩 + 투영 (mmsi 제거)
+        start_emb = self.cat_projections[0](self.start_area_embed(x_cat[:, :, 0]))
+        end_emb = self.cat_projections[1](self.end_area_embed(x_cat[:, :, 1]))
+        grid_emb = self.cat_projections[2](self.grid_embed(x_cat[:, :, 2]))
 
-        cat_vars = [mmsi_emb, start_emb, end_emb, grid_emb]
+        cat_vars = [start_emb, end_emb, grid_emb]
 
         # ===================
         # 2. Variable Selection
         # ===================
-        all_vars = numeric_vars + cat_vars  # 9개 변수
+        all_vars = numeric_vars + cat_vars  # V3: 7개 변수 (4 numeric + 3 cat)
         selected, var_weights = self.var_selection(all_vars)  # [B, T, hidden_dim]
 
         # ===================
@@ -590,7 +610,7 @@ class TemporalFusionTransformer(nn.Module):
         """Attention 가중치 반환 (해석용)"""
         self.eval()
         with torch.no_grad():
-            B, T, _ = x_num.shape
+            _, T, _ = x_num.shape
 
             # Forward pass와 동일하지만 attention weights 반환
             numeric_vars = []
@@ -599,12 +619,12 @@ class TemporalFusionTransformer(nn.Module):
                 projected = self.numeric_projections[i](var)
                 numeric_vars.append(projected)
 
-            mmsi_emb = self.cat_projections[0](self.mmsi_embed(x_cat[:, :, 0]))
-            start_emb = self.cat_projections[1](self.start_area_embed(x_cat[:, :, 1]))
-            end_emb = self.cat_projections[2](self.end_area_embed(x_cat[:, :, 2]))
-            grid_emb = self.cat_projections[3](self.grid_embed(x_cat[:, :, 3]))
+            # V3: mmsi 제거
+            start_emb = self.cat_projections[0](self.start_area_embed(x_cat[:, :, 0]))
+            end_emb = self.cat_projections[1](self.end_area_embed(x_cat[:, :, 1]))
+            grid_emb = self.cat_projections[2](self.grid_embed(x_cat[:, :, 2]))
 
-            cat_vars = [mmsi_emb, start_emb, end_emb, grid_emb]
+            cat_vars = [start_emb, end_emb, grid_emb]
             all_vars = numeric_vars + cat_vars
 
             selected, var_weights = self.var_selection(all_vars)
@@ -625,19 +645,18 @@ class TemporalFusionTransformer(nn.Module):
 # LSTM + Attention Model
 # =============================================================================
 
-class LSTMAttentionModel(nn.Module):
+class LSTMAttentionModelV3(nn.Module):
     """
-    LSTM + Attention 모델
+    LSTM + Attention 모델 V3
+    - mmsi 제거, Vx/Vy 속도 벡터 사용
     - LSTM으로 시퀀스 인코딩 후 Attention으로 중요 타임스텝 가중
-    - TFT보다 단순하지만 순수 LSTM보다 성능 향상
     """
     def __init__(self,
-                 num_features=5,
+                 num_features=4,  # V3: lat, lon, vx, vy
                  hidden_dim=128,
                  num_layers=2,
-                 output_dim=5,
+                 output_dim=4,   # V3: lat, lon, vx, vy
                  dropout=0.2,
-                 num_mmsi=1000,
                  num_start_area=50,
                  num_end_area=50,
                  num_grids=10000,
@@ -649,14 +668,13 @@ class LSTMAttentionModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.embed_dim = embed_dim
 
-        # Embeddings
-        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        # V3: Embeddings (mmsi 제거)
         self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
         self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
         self.grid_embed = nn.Embedding(num_grids, embed_dim)
 
-        # LSTM
-        lstm_input_dim = num_features + 4 * embed_dim
+        # LSTM - V3: 3개 임베딩
+        lstm_input_dim = num_features + 3 * embed_dim
         self.lstm = nn.LSTM(lstm_input_dim, hidden_dim, num_layers,
                            batch_first=True, dropout=dropout, bidirectional=False)
 
@@ -680,15 +698,14 @@ class LSTMAttentionModel(nn.Module):
         )
 
     def forward(self, x_num, x_cat):
-        B, T, _ = x_num.shape
+        _, T, _ = x_num.shape
 
-        # Embeddings
-        mmsi_emb = self.mmsi_embed(x_cat[:, :, 0])
-        start_emb = self.start_area_embed(x_cat[:, :, 1])
-        end_emb = self.end_area_embed(x_cat[:, :, 2])
-        grid_emb = self.grid_embed(x_cat[:, :, 3])
+        # V3: Embeddings (mmsi 제거)
+        start_emb = self.start_area_embed(x_cat[:, :, 0])
+        end_emb = self.end_area_embed(x_cat[:, :, 1])
+        grid_emb = self.grid_embed(x_cat[:, :, 2])
 
-        x = torch.cat([x_num, mmsi_emb, start_emb, end_emb, grid_emb], dim=-1)
+        x = torch.cat([x_num, start_emb, end_emb, grid_emb], dim=-1)
 
         # LSTM encoding
         lstm_out, _ = self.lstm(x)  # [B, T, hidden_dim]
@@ -735,20 +752,20 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class TransformerTrajectoryModel(nn.Module):
+class TransformerTrajectoryModelV3(nn.Module):
     """
-    Pure Transformer 모델 (LSTM 없음)
+    Pure Transformer 모델 V3 (LSTM 없음)
+    - mmsi 제거, Vx/Vy 속도 벡터 사용
     - 순수 Self-Attention 기반
     - 병렬 처리로 빠른 학습
     """
     def __init__(self,
-                 num_features=5,
+                 num_features=4,  # V3: lat, lon, vx, vy
                  hidden_dim=128,
-                 output_dim=5,
+                 output_dim=4,    # V3: lat, lon, vx, vy
                  n_heads=4,
                  num_layers=4,
                  dropout=0.1,
-                 num_mmsi=1000,
                  num_start_area=50,
                  num_end_area=50,
                  num_grids=10000,
@@ -760,14 +777,13 @@ class TransformerTrajectoryModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.embed_dim = embed_dim
 
-        # Embeddings
-        self.mmsi_embed = nn.Embedding(num_mmsi, embed_dim)
+        # V3: Embeddings (mmsi 제거)
         self.start_area_embed = nn.Embedding(num_start_area, embed_dim)
         self.end_area_embed = nn.Embedding(num_end_area, embed_dim)
         self.grid_embed = nn.Embedding(num_grids, embed_dim)
 
-        # Input projection
-        input_dim = num_features + 4 * embed_dim
+        # V3: Input projection (3개 임베딩)
+        input_dim = num_features + 3 * embed_dim
         self.input_proj = nn.Linear(input_dim, hidden_dim)
 
         # Positional Encoding
@@ -794,15 +810,14 @@ class TransformerTrajectoryModel(nn.Module):
         )
 
     def forward(self, x_num, x_cat):
-        B, T, _ = x_num.shape
+        _, T, _ = x_num.shape
 
-        # Embeddings
-        mmsi_emb = self.mmsi_embed(x_cat[:, :, 0])
-        start_emb = self.start_area_embed(x_cat[:, :, 1])
-        end_emb = self.end_area_embed(x_cat[:, :, 2])
-        grid_emb = self.grid_embed(x_cat[:, :, 3])
+        # V3: Embeddings (mmsi 제거)
+        start_emb = self.start_area_embed(x_cat[:, :, 0])
+        end_emb = self.end_area_embed(x_cat[:, :, 1])
+        grid_emb = self.grid_embed(x_cat[:, :, 2])
 
-        x = torch.cat([x_num, mmsi_emb, start_emb, end_emb, grid_emb], dim=-1)
+        x = torch.cat([x_num, start_emb, end_emb, grid_emb], dim=-1)
 
         # Input projection
         x = self.input_proj(x)  # [B, T, hidden_dim]
@@ -823,26 +838,43 @@ class TransformerTrajectoryModel(nn.Module):
         return self.output_layer(out[:, -1, :])
 
 
-def loss_with_smoothness(y_pred, y_true, x_last,
-                         w_mse=(2, 2, 1, 3, 3),
-                         smooth_lambda=0.05,
-                         sog_lambda=0.10,
-                         heading_lambda=0.02,
-                         turn_boost=2.0):
-    """Smoothness 정규화 포함 Loss"""
+def loss_with_smoothness_v3(y_pred, y_true, x_last,
+                            w_mse=(2, 2, 1, 1),  # V3: lat, lon, vx, vy
+                            smooth_lambda=0.05,
+                            velocity_lambda=0.05,
+                            turn_boost=2.0,
+                            velocity_inertia_lambda=0.0):
+    """
+    V3 Smoothness 정규화 포함 Loss
+    - 속도 벡터(vx, vy) 기반
+
+    Parameters:
+    -----------
+    w_mse: tuple
+        각 출력 변수의 가중치 (lat, lon, vx, vy)
+    velocity_lambda: float
+        속도 변화량 제약 (vx, vy 급변 방지)
+    velocity_inertia_lambda: float
+        속도 관성 정규화 (이전 속도 유지)
+    """
     w = torch.tensor(w_mse, device=y_pred.device, dtype=y_pred.dtype).view(1, -1)
 
-    true_heading_change = ((y_true[:, 3:5] - x_last[:, 3:5]) ** 2).sum(dim=1).sqrt()
-    turn_weight = 1.0 + turn_boost * true_heading_change
+    # V3: 속도 벡터 변화량 (vx, vy)
+    true_velocity_change = ((y_true[:, 2:4] - x_last[:, 2:4]) ** 2).sum(dim=1).sqrt()
+    turn_weight = 1.0 + turn_boost * true_velocity_change
     turn_weight = turn_weight.unsqueeze(1)
 
     mse = ((y_pred - y_true) ** 2 * w * turn_weight).mean()
 
-    dsog = (y_pred[:, 2] - x_last[:, 2]).abs().mean()
-    dheading = (y_pred[:, 3:5] - x_last[:, 3:5]).abs().mean()
+    # Velocity Inertia: 이전 속도 벡터와 예측 속도 벡터의 차이가 작도록
+    velocity_diff = ((y_pred[:, 2:4] - x_last[:, 2:4]) ** 2).sum(dim=1).mean()
+    inertia_loss = velocity_inertia_lambda * velocity_diff
 
-    smooth = sog_lambda * dsog + heading_lambda * dheading
-    return mse + smooth_lambda * smooth
+    # Smoothness: 속도 변화량 제약
+    dvelocity = (y_pred[:, 2:4] - x_last[:, 2:4]).abs().mean()
+    smooth = velocity_lambda * dvelocity
+
+    return mse + smooth_lambda * smooth + inertia_loss
 
 
 def load_prepared_data(data_dir):
@@ -889,16 +921,15 @@ def train_model(
     lr=LR,
     save_dir=SAVE_DIR,
     device=None,
-    patience=50,
+    patience=30,
     min_delta=1e-5,
-    warmup_epochs=50,
+    warmup_epochs=200,
     use_scheduler=True,
     lr_patience=8,
     lr_factor=0.5,
     min_lr=1e-6,
     smooth_lambda=0.05,
-    sog_lambda=0.10,
-    heading_lambda=0.02,
+    velocity_lambda=0.05,  # V3: 속도 변화량 제약
     turn_boost=3.0,
     embed_dim=16,
     grad_clip_norm=1.0,
@@ -910,6 +941,7 @@ def train_model(
     n_heads=4,
     num_lstm_layers=2,
     dropout=0.1,
+    velocity_inertia_lambda=0.0,  # V3: 속도 벡터 관성 정규화 강도
 ):
     """모델 학습"""
     if device is None:
@@ -962,78 +994,74 @@ def train_model(
     print(f"  - chunk_size: {chunk_size} segments/chunk")
     print(f"  - train chunks: {chunked_trainer.n_train_chunks}, val chunks: {chunked_trainer.n_val_chunks}")
 
-    # 모델 생성
-    print(f"\n[INFO] 모델 타입: {model_type.upper()}")
+    # V3: 모델 생성 (4개 수치형, 3개 범주형)
+    print(f"\n[INFO] 모델 타입: {model_type.upper()} (V3)")
 
     model_type_lower = model_type.lower()
 
     if model_type_lower == "tft":
-        model = TemporalFusionTransformer(
-            num_features=5,
+        model = TemporalFusionTransformerV3(
+            num_features=4,  # V3: lat, lon, vx, vy
             hidden_dim=hidden_dim,
-            output_dim=5,
+            output_dim=4,
             n_heads=n_heads,
             dropout=dropout,
-            num_mmsi=int(meta['num_mmsi']),
             num_start_area=int(meta['num_start_area']),
             num_end_area=int(meta['num_end_area']),
             num_grids=int(meta['total_grids']) + 1,
             embed_dim=embed_dim,
             num_lstm_layers=num_lstm_layers,
         ).to(device)
-        model_filename = "model_tft.pth"
-        scaler_filename = "scaler_tft.npz"
+        model_filename = "model_tft_v3.pth"
+        scaler_filename = "scaler_tft_v3.npz"
 
     elif model_type_lower == "transformer":
-        model = TransformerTrajectoryModel(
-            num_features=5,
+        model = TransformerTrajectoryModelV3(
+            num_features=4,
             hidden_dim=hidden_dim,
-            output_dim=5,
+            output_dim=4,
             n_heads=n_heads,
             num_layers=num_lstm_layers,  # Transformer layers
             dropout=dropout,
-            num_mmsi=int(meta['num_mmsi']),
             num_start_area=int(meta['num_start_area']),
             num_end_area=int(meta['num_end_area']),
             num_grids=int(meta['total_grids']) + 1,
             embed_dim=embed_dim,
             max_seq_len=seq_len + 10,
         ).to(device)
-        model_filename = "model_transformer.pth"
-        scaler_filename = "scaler_transformer.npz"
+        model_filename = "model_transformer_v3.pth"
+        scaler_filename = "scaler_transformer_v3.npz"
 
     elif model_type_lower == "lstm_attn":
-        model = LSTMAttentionModel(
-            num_features=5,
+        model = LSTMAttentionModelV3(
+            num_features=4,
             hidden_dim=hidden_dim,
             num_layers=num_lstm_layers,
-            output_dim=5,
+            output_dim=4,
             dropout=dropout,
-            num_mmsi=int(meta['num_mmsi']),
             num_start_area=int(meta['num_start_area']),
             num_end_area=int(meta['num_end_area']),
             num_grids=int(meta['total_grids']) + 1,
             embed_dim=embed_dim,
             n_heads=n_heads,
         ).to(device)
-        model_filename = "model_lstm_attn.pth"
-        scaler_filename = "scaler_lstm_attn.npz"
+        model_filename = "model_lstm_attn_v3.pth"
+        scaler_filename = "scaler_lstm_attn_v3.npz"
 
     else:  # lstm (default)
-        model = LSTMTrajectoryModelV2(
-            num_features=5,
+        model = LSTMTrajectoryModelV3(
+            num_features=4,
             hidden_dim=hidden_dim,
             num_layers=num_lstm_layers,
-            output_dim=5,
+            output_dim=4,
             dropout=dropout,
-            num_mmsi=int(meta['num_mmsi']),
             num_start_area=int(meta['num_start_area']),
             num_end_area=int(meta['num_end_area']),
             num_grids=int(meta['total_grids']) + 1,
             embed_dim=embed_dim,
         ).to(device)
-        model_filename = "model_lstm.pth"
-        scaler_filename = "scaler_lstm.npz"
+        model_filename = "model_lstm_v3.pth"
+        scaler_filename = "scaler_lstm_v3.npz"
 
     # 모델 파라미터 수 출력
     total_params = sum(p.numel() for p in model.parameters())
@@ -1100,12 +1128,12 @@ def train_model(
 
                 optimizer.zero_grad()
                 y_pred = model(x_num, x_cat)
-                loss = loss_with_smoothness(
+                loss = loss_with_smoothness_v3(
                     y_pred, y, x_last,
                     smooth_lambda=smooth_lambda,
-                    sog_lambda=sog_lambda,
-                    heading_lambda=heading_lambda,
+                    velocity_lambda=velocity_lambda,
                     turn_boost=turn_boost,
+                    velocity_inertia_lambda=velocity_inertia_lambda,
                 )
                 loss.backward()
 
@@ -1160,12 +1188,12 @@ def train_model(
                     x_last = chunk_ds.X_last[start:end]
 
                     y_pred = model(x_num, x_cat)
-                    loss = loss_with_smoothness(
+                    loss = loss_with_smoothness_v3(
                         y_pred, y, x_last,
                         smooth_lambda=smooth_lambda,
-                        sog_lambda=sog_lambda,
-                        heading_lambda=heading_lambda,
+                        velocity_lambda=velocity_lambda,
                         turn_boost=turn_boost,
+                        velocity_inertia_lambda=velocity_inertia_lambda,
                     )
                     chunk_loss += loss * x_num.size(0)
                     chunk_count += x_num.size(0)
@@ -1201,10 +1229,10 @@ def train_model(
         if scheduler is not None:
             scheduler.step(va_loss)
 
-        # 체크포인트 저장
-        epoch_model_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pth")
+        # 체크포인트 저장 (파일명에 val_loss 포함)
+        epoch_model_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}_loss_{va_loss:.6f}.pth")
         torch.save(model.state_dict(), epoch_model_path)
-        print(f"  [CHECKPOINT] epoch {epoch} 저장")
+        print(f"  [CHECKPOINT] epoch {epoch} 저장 (val_loss={va_loss:.6f})")
 
         # Best 모델 갱신
         improved = (best_val - va_loss) > min_delta
@@ -1217,19 +1245,19 @@ def train_model(
             torch.save(model.state_dict(), model_path)
             np.savez(
                 scaler_path,
+                # V3 버전 정보
+                version='v3',
                 x_mean=meta['x_mean'],
                 x_std=meta['x_std'],
                 y_mean=meta['y_mean'],
                 y_std=meta['y_std'],
                 seq_len=int(seq_len),
                 stride=int(meta['stride']),
-                numeric_cols=meta['numeric_cols'],
-                cat_cols=meta['cat_cols'],
+                numeric_cols=meta['numeric_cols'],  # V3: lat, lon, vx, vy
+                cat_cols=meta['cat_cols'],  # V3: start_area_id, end_area_id, grid_id
                 target_cols=meta['target_cols'],
-                mmsi_vocab=meta['mmsi_vocab'],
                 start_vocab=meta['start_vocab'],
                 end_vocab=meta['end_vocab'],
-                num_mmsi=int(meta['num_mmsi']),
                 num_start_area=int(meta['num_start_area']),
                 num_end_area=int(meta['num_end_area']),
                 grid_info_lat_min=float(meta['grid_info_lat_min']),
@@ -1240,21 +1268,21 @@ def train_model(
                 num_rows=int(meta['num_rows']),
                 num_cols=int(meta['num_cols']),
                 total_grids=int(meta['total_grids']),
-                cog_mirror=bool(meta['cog_mirror']),
                 embed_dim=int(embed_dim),
                 best_epoch=int(best_epoch),
                 best_val=float(best_val),
                 smooth_lambda=float(smooth_lambda),
-                sog_lambda=float(sog_lambda),
-                heading_lambda=float(heading_lambda),
+                velocity_lambda=float(velocity_lambda),
                 lat_bounds=meta['lat_bounds'],
                 lon_bounds=meta['lon_bounds'],
-                # TFT 추가 정보
+                # 모델 정보
                 model_type=model_type,
                 hidden_dim=int(hidden_dim),
                 n_heads=int(n_heads),
                 num_lstm_layers=int(num_lstm_layers),
                 dropout=float(dropout),
+                # V3 속도 벡터 관련
+                velocity_inertia_lambda=float(velocity_inertia_lambda),
             )
             print(f"  [BEST] 최고 모델 갱신됨 (epoch={epoch}, val_loss={va_loss:.6f})")
         else:
@@ -1312,23 +1340,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    parser.add_argument("--data_dir", type=str, default="prepared_data",
-                        help="전처리된 데이터 폴더 (기본값: prepared_data)")
-    parser.add_argument("--epochs", type=int, default=300,
+    parser.add_argument("--data_dir", type=str, default="prepared_data_v3",
+                        help="전처리된 데이터 폴더 (기본값: prepared_data_v3)")
+    parser.add_argument("--epochs", type=int, default=100,
                         help="최대 학습 에폭 (기본값: 300)")
     parser.add_argument("--batch_size", type=int, default=256,
                         help="배치 크기 (기본값: 256)")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="학습률 (기본값: 0.001)")
-    parser.add_argument("--patience", type=int, default=20,
+    parser.add_argument("--patience", type=int, default=4,
                         help="Early stopping patience (기본값: 20)")
-    parser.add_argument("--warmup_epochs", type=int, default=30,
+    parser.add_argument("--warmup_epochs", type=int, default=10,
                         help="Warmup 에폭 수 (기본값: 30)")
     parser.add_argument("--smooth_lambda", type=float, default=0.05,
                         help="Smoothness 정규화 계수 (기본값: 0.05)")
-    parser.add_argument("--heading_lambda", type=float, default=0.02,
-                        help="침로 smoothness 계수 (기본값: 0.02)")
-    parser.add_argument("--turn_boost", type=float, default=2.0,
+    parser.add_argument("--velocity_lambda", type=float, default=0.05,
+                        help="V3: 속도 변화량 제약 (기본값: 0.05)")
+    parser.add_argument("--turn_boost", type=float, default=3.0,
                         help="변침 구간 가중치 (기본값: 2.0)")
     parser.add_argument("--embed_dim", type=int, default=16,
                         help="Embedding 차원 (기본값: 16)")
@@ -1348,10 +1376,12 @@ def main():
                         help="Hidden dimension (기본값: 128)")
     parser.add_argument("--n_heads", type=int, default=4,
                         help="Attention heads 수 (TFT 전용, 기본값: 4)")
-    parser.add_argument("--num_lstm_layers", type=int, default=2,
+    parser.add_argument("--num_lstm_layers", type=int, default=3,
                         help="LSTM 레이어 수 (기본값: 2)")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout 비율 (기본값: 0.1)")
+    parser.add_argument("--velocity_inertia_lambda", type=float, default=0.0,
+                        help="V3: 속도 벡터 관성 정규화 강도 (기본값: 0.0)")
 
     args = parser.parse_args()
 
@@ -1386,7 +1416,7 @@ def main():
         patience=args.patience,
         warmup_epochs=args.warmup_epochs,
         smooth_lambda=args.smooth_lambda,
-        heading_lambda=args.heading_lambda,
+        velocity_lambda=args.velocity_lambda,
         turn_boost=args.turn_boost,
         embed_dim=args.embed_dim,
         val_ratio=args.val_ratio,
@@ -1396,6 +1426,7 @@ def main():
         n_heads=args.n_heads,
         num_lstm_layers=args.num_lstm_layers,
         dropout=args.dropout,
+        velocity_inertia_lambda=args.velocity_inertia_lambda,
     )
 
     print("\n" + "=" * 60)

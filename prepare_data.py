@@ -1,14 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-학습 데이터 전처리 및 저장 (Multiprocessing 버전)
-================================================
+학습 데이터 전처리 및 저장 (Multiprocessing 버전) - V3
+======================================================
 멀티프로세싱을 사용하여 병렬 처리
 + 해역 경계 마스크 및 밀도 기반 기준 항로 생성
+
+V3 변경사항:
+- sin_cog, cos_cog 제거 → Vx, Vy (속도 벡터)로 대체
+  - Vx = SOG × sin(COG): 동쪽(+), 서쪽(-)
+  - Vy = SOG × cos(COG): 북쪽(+), 남쪽(-)
+- mmsi_idx 범주형 변수 제거
 
 사용법:
     python prepare_data.py --data_folder "G:/NIA_ai_project/항적데이터 추출/여수" \
                            --transition_folder "area_transition_results" \
-                           --output_dir "prepared_data" \
+                           --output_dir "prepared_data_v3" \
                            --seq_len 50 --stride 3 --num_workers 4
 """
 
@@ -356,9 +362,10 @@ def get_file_list(transition_df, data_folder):
     return file_list
 
 
-def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
+def process_single_file_for_stats(file_info, seq_len):
     """
     단일 파일 처리 - 통계 수집용 (Pass 1)
+    V3: Vx, Vy 속도 벡터 사용
     Returns: dict with stats or None
     """
     try:
@@ -381,16 +388,16 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
 
         segments = split_by_gap(trj, max_gap_days=1)
 
+        # V3: 4개 피처 (lat, lon, vx, vy) - sog는 vx, vy에 내포됨
         result = {
             'file_idx': file_info['fid'],
             'n_total': 0,
-            'sum_x': np.zeros(5, dtype=np.float64),
-            'sum_x2': np.zeros(5, dtype=np.float64),
+            'sum_x': np.zeros(4, dtype=np.float64),
+            'sum_x2': np.zeros(4, dtype=np.float64),
             'lat_min': float('inf'),
             'lat_max': float('-inf'),
             'lon_min': float('inf'),
             'lon_max': float('-inf'),
-            'mmsi_set': set(),
             'start_area_set': set(),
             'end_area_set': set(),
             'segment_infos': [],
@@ -409,17 +416,19 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
             if n < seq_len + 1:
                 continue
 
-            sin_cog = np.sin(np.radians(intp_df["cog"].values))
-            cos_cog = np.cos(np.radians(intp_df["cog"].values))
-            if cog_mirror:
-                sin_cog = -sin_cog
+            # V3: 속도 벡터 계산
+            # Vx = SOG × sin(COG): 동쪽(+), 서쪽(-)
+            # Vy = SOG × cos(COG): 북쪽(+), 남쪽(-)
+            cog_rad = np.radians(intp_df["cog"].values)
+            sog = intp_df["sog"].values
+            vx = sog * np.sin(cog_rad)  # 동쪽 방향 속도
+            vy = sog * np.cos(cog_rad)  # 북쪽 방향 속도
 
             x = np.column_stack([
                 intp_df["lat"].values,
                 intp_df["lon"].values,
-                intp_df["sog"].values,
-                sin_cog,
-                cos_cog,
+                vx,
+                vy,
             ]).astype(np.float64)
 
             result['n_total'] += n
@@ -439,7 +448,6 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
             result['all_lat'].extend(lat_arr[sample_idx].tolist())
             result['all_lon'].extend(lon_arr[sample_idx].tolist())
 
-            result['mmsi_set'].add(file_info['mmsi'])
             result['start_area_set'].add(intp_df["start_area"].iloc[0])
             result['end_area_set'].add(intp_df["end_area"].iloc[0])
 
@@ -448,7 +456,6 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
                 'seg_idx': seg_idx,
                 'length': n,
                 'fid': file_info['fid'],
-                'mmsi': file_info['mmsi'],
                 'start_area': intp_df["start_area"].iloc[0],
                 'end_area': intp_df["end_area"].iloc[0],
             })
@@ -462,9 +469,10 @@ def process_single_file_for_stats(file_info, seq_len, cog_mirror=True):
 def process_single_file_for_data(args):
     """
     단일 파일 처리 - 데이터 생성용 (Pass 2)
+    V3: Vx, Vy 속도 벡터 사용, mmsi 제거
     """
-    file_info, seg_infos, seq_len, stride, cog_mirror, x_mean, x_std, \
-        mmsi_vocab, start_vocab, end_vocab, grid_info = args
+    file_info, seg_infos, seq_len, stride, x_mean, x_std, \
+        start_vocab, end_vocab, grid_info = args
 
     try:
         trj = pd.read_csv(file_info['filepath'], encoding='cp949')
@@ -492,13 +500,12 @@ def process_single_file_for_data(args):
             if intp_df is not None and len(intp_df) > 0:
                 intp_df = intp_df.sort_values("datetime").reset_index(drop=True)
 
-                sin_cog = np.sin(np.radians(intp_df["cog"].values))
-                cos_cog = np.cos(np.radians(intp_df["cog"].values))
-                if cog_mirror:
-                    sin_cog = -sin_cog
+                # V3: 속도 벡터 계산
+                cog_rad = np.radians(intp_df["cog"].values)
+                sog = intp_df["sog"].values
+                intp_df["vx"] = sog * np.sin(cog_rad)  # 동쪽 방향 속도
+                intp_df["vy"] = sog * np.cos(cog_rad)  # 북쪽 방향 속도
 
-                intp_df["sin_cog"] = sin_cog
-                intp_df["cos_cog"] = cos_cog
                 segments.append(intp_df)
 
         results = []
@@ -515,18 +522,18 @@ def process_single_file_for_data(args):
             if n < seq_len + 1:
                 continue
 
+            # V3: 4개 피처 (lat, lon, vx, vy)
             x = np.column_stack([
                 seg_df["lat"].values,
                 seg_df["lon"].values,
-                seg_df["sog"].values,
-                seg_df["sin_cog"].values,
-                seg_df["cos_cog"].values,
+                seg_df["vx"].values,
+                seg_df["vy"].values,
             ]).astype(np.float32)
 
             xn = (x - x_mean) / x_std
             yn = xn.copy()
 
-            mmsi_id = mmsi_vocab.get(seg_info['mmsi'], 0)
+            # V3: mmsi 제거, start/end/grid만 사용
             start_id = start_vocab.get(seg_info['start_area'], 0)
             end_id = end_vocab.get(seg_info['end_area'], 0)
 
@@ -537,8 +544,8 @@ def process_single_file_for_data(args):
             grid_ids = grid_rows * grid_info['num_cols'] + grid_cols
             grid_ids = np.clip(grid_ids, 0, grid_info['total_grids'])
 
+            # V3: 3개 범주형 변수 (start, end, grid) - mmsi 제거
             x_cat = np.column_stack([
-                np.full(n, mmsi_id),
                 np.full(n, start_id),
                 np.full(n, end_id),
                 grid_ids,
@@ -570,8 +577,8 @@ def main():
     parser.add_argument("--transition_folder", type=str,
                         default="area_transition_results",
                         help="전이 정보 CSV 파일이 저장된 폴더")
-    parser.add_argument("--output_dir", type=str, default="prepared_data",
-                        help="전처리된 데이터 저장 폴더 (기본값: prepared_data)")
+    parser.add_argument("--output_dir", type=str, default="prepared_data_v3",
+                        help="전처리된 데이터 저장 폴더 (기본값: prepared_data_v3)")
     parser.add_argument("--seq_len", type=int, default=50,
                         help="시퀀스 길이 (기본값: 50)")
     parser.add_argument("--stride", type=int, default=3,
@@ -593,10 +600,9 @@ def main():
     stride = args.stride
     grid_size = args.grid_size
     num_workers = min(args.num_workers, cpu_count())
-    cog_mirror = True
 
     print("=" * 60)
-    print("학습 데이터 전처리 (Multiprocessing 버전)")
+    print("학습 데이터 전처리 V3 (Vx/Vy 속도 벡터)")
     print("=" * 60)
     print(f"데이터 폴더: {args.data_folder}")
     print(f"전이 정보 폴더: {args.transition_folder}")
@@ -620,18 +626,17 @@ def main():
     # ==============================================
     print(f"\n[STEP 2] 통계 수집 (Pass 1) - {num_workers} workers")
 
-    process_func = partial(process_single_file_for_stats, seq_len=seq_len, cog_mirror=cog_mirror)
+    process_func = partial(process_single_file_for_stats, seq_len=seq_len)
 
     with Pool(num_workers) as pool:
         results = list(pool.imap(process_func, file_list, chunksize=10))
 
-    # 결과 병합
+    # V3: 4개 피처 (lat, lon, vx, vy)
     n_total = 0
-    sum_x = np.zeros(5, dtype=np.float64)
-    sum_x2 = np.zeros(5, dtype=np.float64)
+    sum_x = np.zeros(4, dtype=np.float64)
+    sum_x2 = np.zeros(4, dtype=np.float64)
     lat_min, lat_max = float('inf'), float('-inf')
     lon_min, lon_max = float('inf'), float('-inf')
-    mmsi_set = set()
     start_area_set = set()
     end_area_set = set()
     segment_info_list = []
@@ -649,7 +654,6 @@ def main():
         lat_max = max(lat_max, r['lat_max'])
         lon_min = min(lon_min, r['lon_min'])
         lon_max = max(lon_max, r['lon_max'])
-        mmsi_set.update(r['mmsi_set'])
         start_area_set.update(r['start_area_set'])
         end_area_set.update(r['end_area_set'])
         segment_info_list.extend(r['segment_infos'])
@@ -717,12 +721,10 @@ def main():
     print(f"[INFO] 항로 범위: lat={lat_bounds[0]:.4f}~{lat_bounds[1]:.4f}, lon={lon_bounds[0]:.4f}~{lon_bounds[1]:.4f}")
     print(f"[INFO] 격자: {grid_info['num_rows']}x{grid_info['num_cols']} = {grid_info['total_grids']}")
 
-    # Vocab 생성
-    mmsi_vocab = {v: i+1 for i, v in enumerate(sorted(mmsi_set))}
+    # V3: Vocab 생성 (mmsi 제거)
     start_vocab = {v: i+1 for i, v in enumerate(sorted(start_area_set))}
     end_vocab = {v: i+1 for i, v in enumerate(sorted(end_area_set))}
 
-    print(f"[INFO] MMSI: {len(mmsi_vocab)} 종류")
     print(f"[INFO] Start Area: {len(start_vocab)} 종류")
     print(f"[INFO] End Area: {len(end_vocab)} 종류")
 
@@ -736,14 +738,14 @@ def main():
     for seg_info in segment_info_list:
         file_to_segments[seg_info['file_idx']].append(seg_info)
 
-    # 작업 목록 생성
+    # V3: 작업 목록 생성 (mmsi_vocab, cog_mirror 제거)
     tasks = []
     for file_info in file_list:
         if file_info['fid'] in file_to_segments:
             seg_infos = file_to_segments[file_info['fid']]
             tasks.append((
-                file_info, seg_infos, seq_len, stride, cog_mirror,
-                x_mean, x_std, mmsi_vocab, start_vocab, end_vocab, grid_info
+                file_info, seg_infos, seq_len, stride,
+                x_mean, x_std, start_vocab, end_vocab, grid_info
             ))
 
     # 병렬 처리
@@ -814,23 +816,21 @@ def main():
     )
     print(f"[SAVED] 학습 데이터: {data_path}")
 
-    # 메타 정보
+    # V3: 메타 정보 (mmsi 제거, Vx/Vy 사용)
     meta = {
         'seq_len': seq_len,
         'stride': stride,
         'grid_size': grid_size,
-        'cog_mirror': cog_mirror,
-        'numeric_cols': np.array(['lat', 'lon', 'sog', 'sin_cog', 'cos_cog']),
-        'cat_cols': np.array(['mmsi_id', 'start_area_id', 'end_area_id', 'grid_id']),
-        'target_cols': np.array(['lat', 'lon', 'sog', 'sin_cog', 'cos_cog']),
+        'version': 'v3',  # 버전 표시
+        'numeric_cols': np.array(['lat', 'lon', 'vx', 'vy']),  # V3: sog/cog 대신 vx/vy
+        'cat_cols': np.array(['start_area_id', 'end_area_id', 'grid_id']),  # V3: mmsi 제거
+        'target_cols': np.array(['lat', 'lon', 'vx', 'vy']),
         'x_mean': x_mean,
         'x_std': x_std,
         'y_mean': y_mean,
         'y_std': y_std,
-        'mmsi_vocab': str(mmsi_vocab),
         'start_vocab': str(start_vocab),
         'end_vocab': str(end_vocab),
-        'num_mmsi': len(mmsi_vocab) + 1,
         'num_start_area': len(start_vocab) + 1,
         'num_end_area': len(end_vocab) + 1,
         'grid_info_lat_min': grid_info['lat_min'],
