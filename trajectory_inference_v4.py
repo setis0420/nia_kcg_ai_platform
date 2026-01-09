@@ -267,7 +267,7 @@ class GridTrajectoryInferenceV4:
             dropout=0.0,  # 추론 시 dropout 비활성화
             num_start_area=self.num_start_area,
             num_end_area=self.num_end_area,
-            max_seq_len=self.seq_len + 100,
+            max_seq_len=self.seq_len + self.pred_len + 10,  # 학습 시와 동일
         ).to(self.device)
 
         self.model.load_state_dict(
@@ -542,17 +542,284 @@ class GridTrajectoryInferenceV4:
 
 
 # ============================================
-# 테스트
+# 테스트 (10노트 이상 선박 10개)
 # ============================================
 
 if __name__ == "__main__":
-    print("GridTrajectoryInferenceV4 - 격자 기반 항적 예측")
-    print()
-    print("사용 예시:")
-    print('  inferencer = GridTrajectoryInferenceV4(')
-    print('      model_path="model/yeosu/model_v4/model_v4_best.pth",')
-    print('      vocab_path="prepared_data_v4/grid_vocab.json",')
-    print('      scaler_path="model/yeosu/model_v4/scaler_v4.npz"')
-    print('  )')
-    print()
-    print('  preds = inferencer.predict(df, n_steps=30, start_area="남쪽 진입", end_area="여수정박지B")')
+    import sys
+    from glob import glob
+    import random
+
+    print("=" * 70)
+    print("GridTrajectoryInferenceV4 - 10노트 이상 선박 10개 테스트")
+    print("=" * 70)
+
+    # 모델 경로
+    model_path = "model/yeosu/model_v4/model_v4_best.pth"
+    vocab_path = "prepared_data_v4/grid_vocab.json"
+    scaler_path = "model/yeosu/model_v4/scaler_v4.npz"
+
+    # 모델 로드
+    print("\n[1] 모델 로드...")
+    try:
+        inferencer = GridTrajectoryInferenceV4(
+            model_path=model_path,
+            vocab_path=vocab_path,
+            scaler_path=scaler_path
+        )
+    except Exception as e:
+        print(f"[ERROR] 모델 로드 실패: {e}")
+        sys.exit(1)
+
+    # 테스트 데이터 검색
+    print("\n[2] 10노트 이상 선박 검색...")
+    data_folder = "G:/NIA_ai_project/항적데이터 추출/여수"
+    csv_files = glob(os.path.join(data_folder, "*.csv"))
+    print(f"  - 총 파일 수: {len(csv_files)}")
+
+    # 10노트 이상 선박 찾기 (최대 10개)
+    MIN_SOG = 10.0  # 최소 평균 속력 (노트)
+    NUM_SHIPS = 10  # 테스트할 선박 수
+
+    test_files = []
+    for f in csv_files:
+        try:
+            df_temp = pd.read_csv(f, encoding='utf-8')
+            avg_sog = df_temp['sog'].mean()
+            if len(df_temp) >= 70 and avg_sog >= MIN_SOG:
+                # 파일명에서 MMSI 추출
+                filename = os.path.basename(f)
+                parts = filename.replace('.csv', '').split('_')
+                mmsi = parts[0] if len(parts) >= 1 else "unknown"
+
+                test_files.append({
+                    'path': f,
+                    'mmsi': mmsi,
+                    'avg_sog': avg_sog,
+                    'n_points': len(df_temp),
+                    'start_area': parts[1] if len(parts) >= 3 else "남쪽 진입",
+                    'end_area': parts[2] if len(parts) >= 3 else "여수정박지B",
+                })
+
+                if len(test_files) >= NUM_SHIPS:
+                    break
+        except:
+            continue
+
+    print(f"  - 찾은 선박 수: {len(test_files)}")
+
+    if len(test_files) == 0:
+        print("[ERROR] 10노트 이상 선박을 찾을 수 없습니다.")
+        sys.exit(1)
+
+    # 각 선박별 테스트 결과 저장
+    all_results = []
+    colors = ['red', 'orange', 'purple', 'darkgreen', 'darkblue',
+              'brown', 'pink', 'gray', 'olive', 'cyan']
+
+    print("\n[3] 선박별 예측 수행...")
+    print("=" * 100)
+    print(f"{'No':>3} | {'MMSI':>12} | {'평균SOG':>8} | {'출발':>10} | {'도착':>12} | {'평균오차(m)':>10} | {'SOG오차':>8}")
+    print("-" * 100)
+
+    for idx, ship_info in enumerate(test_files):
+        # 데이터 로드
+        df = pd.read_csv(ship_info['path'], encoding='utf-8')
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.sort_values('datetime').reset_index(drop=True)
+
+        # 입력/실제 분리
+        input_df = df.iloc[:50].copy()
+        actual_future = df.iloc[50:60].copy()
+
+        # 예측
+        predictions = inferencer.predict(
+            input_df,
+            n_steps=10,
+            start_area=ship_info['start_area'],
+            end_area=ship_info['end_area']
+        )
+
+        # 오차 계산
+        errors = []
+        sog_errors = []
+        for pred_row, actual_row in zip(predictions.itertuples(), actual_future.itertuples()):
+            dlat = (pred_row.lat - actual_row.lat) * 111000
+            dlon = (pred_row.lon - actual_row.lon) * 111000 * np.cos(np.radians(actual_row.lat))
+            dist_error = np.sqrt(dlat**2 + dlon**2)
+            errors.append(dist_error)
+            sog_errors.append(abs(pred_row.sog - actual_row.sog))
+
+        avg_error = np.mean(errors)
+        avg_sog_error = np.mean(sog_errors)
+
+        # 결과 저장 (전체 항적 포함)
+        all_results.append({
+            'mmsi': ship_info['mmsi'],
+            'avg_sog': ship_info['avg_sog'],
+            'start_area': ship_info['start_area'],
+            'end_area': ship_info['end_area'],
+            'avg_error': avg_error,
+            'max_error': np.max(errors),
+            'min_error': np.min(errors),
+            'avg_sog_error': avg_sog_error,
+            'input_df': input_df,
+            'actual_future': actual_future,
+            'predictions': predictions,
+            'full_df': df,  # 전체 항적 저장
+            'color': colors[idx % len(colors)],
+        })
+
+        print(f"{idx+1:>3} | {ship_info['mmsi']:>12} | {ship_info['avg_sog']:>7.1f}kn | "
+              f"{ship_info['start_area'][:10]:>10} | {ship_info['end_area'][:12]:>12} | "
+              f"{avg_error:>10.1f} | {avg_sog_error:>7.2f}kn")
+
+    print("-" * 100)
+
+    # 전체 통계
+    print("\n[4] 전체 통계:")
+    all_errors = [r['avg_error'] for r in all_results]
+    all_sog_errors = [r['avg_sog_error'] for r in all_results]
+    print(f"  - 전체 평균 거리 오차: {np.mean(all_errors):.1f} m")
+    print(f"  - 전체 최대 거리 오차: {np.max([r['max_error'] for r in all_results]):.1f} m")
+    print(f"  - 전체 최소 거리 오차: {np.min([r['min_error'] for r in all_results]):.1f} m")
+    print(f"  - 전체 평균 SOG 오차: {np.mean(all_sog_errors):.2f} knots")
+
+    # Folium 시각화 (모든 선박)
+    try:
+        import folium
+        from folium import FeatureGroup
+
+        print("\n[5] 지도 시각화 생성...")
+
+        # 중심점 계산 (모든 선박의 중간)
+        all_lats = []
+        all_lons = []
+        for r in all_results:
+            all_lats.extend(r['input_df']['lat'].tolist())
+            all_lons.extend(r['input_df']['lon'].tolist())
+        center_lat = np.mean(all_lats)
+        center_lon = np.mean(all_lons)
+
+        m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
+
+        # 각 선박별 레이어 추가
+        for idx, result in enumerate(all_results):
+            ship_name = f"[{idx+1}] {result['mmsi']} ({result['avg_sog']:.1f}kn, 오차:{result['avg_error']:.0f}m)"
+            ship_group = FeatureGroup(name=ship_name)
+
+            # 전체 파일 다시 로드하여 전체 경로 표시
+            full_df = result.get('full_df', None)
+            if full_df is not None:
+                # 전체 경로 (회색, 얇은 선)
+                full_coords = [[r['lat'], r['lon']] for _, r in full_df.iterrows()]
+                folium.PolyLine(
+                    full_coords, color='gray', weight=1, opacity=0.4,
+                    popup=f"{result['mmsi']} 전체 항적"
+                ).add_to(ship_group)
+
+            # 입력 구간 경로 (파랑, 굵은 선)
+            input_coords = [[r['lat'], r['lon']] for _, r in result['input_df'].iterrows()]
+            folium.PolyLine(
+                input_coords, color='blue', weight=3, opacity=0.8,
+                popup=f"{result['mmsi']} 입력 구간 (50분)"
+            ).add_to(ship_group)
+
+            # 실제 미래 경로 (초록, 굵은 선)
+            actual_coords = [[r['lat'], r['lon']] for _, r in result['actual_future'].iterrows()]
+            folium.PolyLine(
+                actual_coords, color='green', weight=3, opacity=0.8,
+                popup=f"{result['mmsi']} 실제 미래 (10분)"
+            ).add_to(ship_group)
+
+            # 입력 시작점 (파랑 마커)
+            folium.CircleMarker(
+                [result['input_df']['lat'].iloc[0], result['input_df']['lon'].iloc[0]],
+                radius=6, color='blue', fill=True, fillOpacity=0.9,
+                popup=f"<b>{result['mmsi']}</b><br>입력 시작<br>{result['input_df']['datetime'].iloc[0]}"
+            ).add_to(ship_group)
+
+            # 예측 시작점 (빨간 큰 마커 + 선박 정보)
+            start_lat = result['input_df']['lat'].iloc[-1]
+            start_lon = result['input_df']['lon'].iloc[-1]
+            start_time = result['input_df']['datetime'].iloc[-1]
+            start_sog = result['input_df']['sog'].iloc[-1]
+            start_cog = result['input_df']['cog'].iloc[-1]
+
+            popup_html = f"""
+            <div style="width:200px">
+                <h4 style="margin:0;color:red;">선박 {idx+1}</h4>
+                <hr style="margin:5px 0">
+                <b>MMSI:</b> {result['mmsi']}<br>
+                <b>출발:</b> {result['start_area']}<br>
+                <b>도착:</b> {result['end_area']}<br>
+                <hr style="margin:5px 0">
+                <b>예측시작 시각:</b><br>{start_time}<br>
+                <b>위치:</b> ({start_lat:.4f}, {start_lon:.4f})<br>
+                <b>SOG:</b> {start_sog:.1f} kn<br>
+                <b>COG:</b> {start_cog:.0f}°<br>
+                <hr style="margin:5px 0">
+                <b style="color:red;">평균오차: {result['avg_error']:.0f}m</b>
+            </div>
+            """
+            folium.Marker(
+                [start_lat, start_lon],
+                popup=folium.Popup(popup_html, max_width=250),
+                icon=folium.Icon(color='red', icon='ship', prefix='fa')
+            ).add_to(ship_group)
+
+            # 예측 경로 (빨강, 점선 스타일)
+            pred_coords = [[r['lat'], r['lon']] for _, r in result['predictions'].iterrows()]
+            folium.PolyLine(
+                pred_coords, color='red', weight=3, opacity=0.8,
+                dash_array='10,5',  # 점선
+                popup=f"{result['mmsi']} V4 예측 (오차: {result['avg_error']:.0f}m)"
+            ).add_to(ship_group)
+
+            # 예측 포인트 (빨강 원)
+            for i, row in result['predictions'].iterrows():
+                folium.CircleMarker(
+                    [row['lat'], row['lon']],
+                    radius=5, color='red', fill=True, fillOpacity=0.7,
+                    popup=f"예측 Step {i+1}<br>SOG: {row['sog']:.1f}kn<br>COG: {row['cog']:.0f}°<br>신뢰도: {row['confidence']:.1%}"
+                ).add_to(ship_group)
+
+            # 실제 미래 포인트 (초록 원)
+            for i, row in result['actual_future'].iterrows():
+                folium.CircleMarker(
+                    [row['lat'], row['lon']],
+                    radius=4, color='green', fill=True, fillOpacity=0.6,
+                    popup=f"실제 Step {i-49}<br>SOG: {row['sog']:.1f}kn<br>COG: {row['cog']:.0f}°"
+                ).add_to(ship_group)
+
+            ship_group.add_to(m)
+
+        # 범례 추가
+        legend_html = """
+        <div style="position: fixed; bottom: 50px; left: 50px; z-index: 1000;
+                    background-color: white; padding: 10px; border: 2px solid grey;
+                    border-radius: 5px; font-size: 12px;">
+            <b>범례</b><br>
+            <i style="background:blue;width:20px;height:3px;display:inline-block;"></i> 입력 경로 (50분)<br>
+            <i style="background:green;width:20px;height:3px;display:inline-block;"></i> 실제 미래 (10분)<br>
+            <i style="background:red;width:20px;height:3px;display:inline-block;border-style:dashed;"></i> V4 예측<br>
+            <i style="background:gray;width:20px;height:1px;display:inline-block;"></i> 전체 항적
+        </div>
+        """
+        m.get_root().html.add_child(folium.Element(legend_html))
+
+        # 레이어 컨트롤 추가
+        folium.LayerControl().add_to(m)
+
+        output_html = 'prediction_v4_multi_ships.html'
+        m.save(output_html)
+        print(f"  - 지도 저장: {output_html}")
+        print("  - 파랑: 입력 경로, 초록: 실제 미래, 빨강(점선): V4 예측")
+        print("  - 좌측 레이어 패널에서 선박별 표시/숨김 가능")
+
+    except ImportError:
+        print("\n[INFO] folium이 없어 지도 시각화 생략")
+
+    print("\n" + "=" * 70)
+    print("테스트 완료!")
+    print("=" * 70)
