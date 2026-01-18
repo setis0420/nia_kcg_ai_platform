@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-V10 학습 데이터 전처리 - 모든 지역 병렬 처리
+V11 학습 데이터 전처리 - 모든 지역 병렬 처리
 ============================================
 - 학습데이터 폴더 내 모든 지역(울산, 부산, 군산, ...) 자동 탐지
-- 각 지역별로 100분 예측용 데이터 생성
+- 각 지역별로 60분 예측용 데이터 생성
 - 멀티프로세싱으로 병렬 처리
+- 1분 간격 보간 적용
+
+V11 변경사항 (V10 대비):
+- 입력 시퀀스: 50분 → 30분
+- 예측 시퀀스: 100분 → 60분
+- 최소 데이터 요구량: 30개 이상
 
 사용법:
-    python preprocess_all_regions_v10.py
-    python preprocess_all_regions_v10.py --regions 부산 울산  # 특정 지역만
-    python preprocess_all_regions_v10.py --workers 4  # 워커 수 지정
+    python preprocess_all_regions_v11.py
+    python preprocess_all_regions_v11.py --regions 부산 울산  # 특정 지역만
+    python preprocess_all_regions_v11.py --workers 4  # 워커 수 지정
 """
 
 import os
@@ -29,11 +35,12 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 # 설정
 # ============================================
 BASE_INPUT_DIR = r"K:\coding_project\NIA_선박항적예측프로그램\학습데이터"
-BASE_OUTPUT_DIR = r"K:\coding_project\NIA_선박항적예측프로그램\학습데이터_전처리\v10"
+BASE_OUTPUT_DIR = r"K:\coding_project\NIA_선박항적예측프로그램\학습데이터_전처리\v11"
 
-DEFAULT_SEQ_LEN = 50    # 입력 시퀀스 길이 (50분)
-DEFAULT_PRED_LEN = 100  # 예측 시퀀스 길이 (100분)
-DEFAULT_STEP = 20       # 슬라이딩 윈도우 스텝
+DEFAULT_SEQ_LEN = 30    # 입력 시퀀스 길이 (30분)
+DEFAULT_PRED_LEN = 60   # 예측 시퀀스 길이 (60분)
+DEFAULT_STEP = 15       # 슬라이딩 윈도우 스텝
+MIN_POINTS = 30         # 보간 후 최소 포인트 수
 
 
 # ============================================
@@ -108,7 +115,7 @@ def interpolate_1min(df):
     })
 
 
-def preprocess_trajectory(df):
+def preprocess_trajectory(df, min_points=MIN_POINTS):
     """단일 항적 전처리 (1분 간격 보간 포함)"""
     required_cols = ['datetime', 'lat', 'lon', 'sog', 'cog']
     optional_cols = ['shiptype', 'length']
@@ -149,7 +156,7 @@ def preprocess_trajectory(df):
     # 1분 간격 보간
     df_interp = interpolate_1min(df)
 
-    if df_interp is None or len(df_interp) < 50:
+    if df_interp is None or len(df_interp) < min_points:
         return None
 
     return {
@@ -163,7 +170,7 @@ def preprocess_trajectory(df):
     }
 
 
-def create_sequences(data, seq_len=50, pred_len=100, step=20):
+def create_sequences(data, seq_len=30, pred_len=60, step=15):
     """시퀀스 데이터 생성"""
     sequences = []
     n = len(data['lat'])
@@ -195,7 +202,7 @@ def create_sequences(data, seq_len=50, pred_len=100, step=20):
     return sequences
 
 
-def process_single_file(fpath, seq_len, pred_len, step):
+def process_single_file(fpath, seq_len, pred_len, step, min_points):
     """단일 파일 처리 (병렬용)"""
     try:
         if fpath.endswith('.parquet'):
@@ -209,7 +216,7 @@ def process_single_file(fpath, seq_len, pred_len, step):
                 except:
                     df = pd.read_csv(fpath, encoding='euc-kr')
 
-        data = preprocess_trajectory(df)
+        data = preprocess_trajectory(df, min_points=min_points)
 
         if data is None:
             return {'status': 'skipped_short', 'sequences': []}
@@ -233,12 +240,13 @@ def process_single_file(fpath, seq_len, pred_len, step):
         return {'status': 'error', 'sequences': [], 'error': str(e)}
 
 
-def process_region(region_name, input_dir, output_dir, seq_len=50, pred_len=100, step=20, n_workers=4):
+def process_region(region_name, input_dir, output_dir, seq_len=30, pred_len=60, step=15, min_points=30, n_workers=4):
     """단일 지역 데이터 병렬 처리"""
     print(f"\n{'='*60}")
     print(f"지역: {region_name} (워커: {n_workers}개)")
     print(f"입력: {input_dir}")
     print(f"출력: {output_dir}")
+    print(f"설정: {seq_len}분 입력 → {pred_len}분 예측, 최소 {min_points}개")
     print(f"{'='*60}")
 
     os.makedirs(output_dir, exist_ok=True)
@@ -286,7 +294,7 @@ def process_region(region_name, input_dir, output_dir, seq_len=50, pred_len=100,
     chunk_size = 300000
 
     # 병렬 처리
-    process_func = partial(process_single_file, seq_len=seq_len, pred_len=pred_len, step=step)
+    process_func = partial(process_single_file, seq_len=seq_len, pred_len=pred_len, step=step, min_points=min_points)
 
     with Pool(processes=n_workers) as pool:
         results = list(tqdm(
@@ -353,7 +361,7 @@ def get_available_regions(base_input_dir):
 
 def process_region_wrapper(args_tuple):
     """지역 병렬 처리용 래퍼"""
-    region, input_dir, output_dir, seq_len, pred_len, step = args_tuple
+    region, input_dir, output_dir, seq_len, pred_len, step, min_points = args_tuple
     return process_region(
         region_name=region,
         input_dir=input_dir,
@@ -361,14 +369,21 @@ def process_region_wrapper(args_tuple):
         seq_len=seq_len,
         pred_len=pred_len,
         step=step,
+        min_points=min_points,
         n_workers=2  # 지역당 워커 수 (지역 병렬이므로 줄임)
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="V10 학습 데이터 전처리 - 모든 지역 병렬 처리",
+        description="V11 학습 데이터 전처리 - 30분→60분 예측",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+예제:
+    python preprocess_all_regions_v11.py --list
+    python preprocess_all_regions_v11.py --regions 울산 부산
+    python preprocess_all_regions_v11.py --region_workers 2
+        """
     )
     parser.add_argument("--input_base", type=str, default=BASE_INPUT_DIR,
                         help="입력 데이터 기본 폴더")
@@ -377,11 +392,13 @@ def main():
     parser.add_argument("--regions", nargs='*', default=None,
                         help="처리할 지역 목록 (미지정시 전체)")
     parser.add_argument("--seq_len", type=int, default=DEFAULT_SEQ_LEN,
-                        help="입력 시퀀스 길이 (기본: 50분)")
+                        help="입력 시퀀스 길이 (기본: 30분)")
     parser.add_argument("--pred_len", type=int, default=DEFAULT_PRED_LEN,
-                        help="예측 시퀀스 길이 (기본: 100분)")
+                        help="예측 시퀀스 길이 (기본: 60분)")
     parser.add_argument("--step", type=int, default=DEFAULT_STEP,
-                        help="슬라이딩 윈도우 스텝 (기본: 20)")
+                        help="슬라이딩 윈도우 스텝 (기본: 15)")
+    parser.add_argument("--min_points", type=int, default=MIN_POINTS,
+                        help="보간 후 최소 포인트 수 (기본: 30)")
     parser.add_argument("--region_workers", type=int, default=4,
                         help="동시 처리할 지역 수 (기본: 4)")
     parser.add_argument("--list", action="store_true",
@@ -411,11 +428,12 @@ def main():
         return
 
     print("=" * 60)
-    print("V10 학습 데이터 전처리 - 지역 병렬 처리")
+    print("V11 학습 데이터 전처리 - 30분→60분 예측")
     print("=" * 60)
     print(f"입력: {args.input_base}")
     print(f"출력: {args.output_base}")
     print(f"설정: {args.seq_len}분 입력 → {args.pred_len}분 예측")
+    print(f"최소 포인트: {args.min_points}개")
     print(f"지역 병렬: {args.region_workers}개 동시 처리")
     print(f"지역: {', '.join(regions_to_process)}")
     print()
@@ -425,7 +443,7 @@ def main():
     for region in regions_to_process:
         input_dir = os.path.join(args.input_base, region)
         output_dir = os.path.join(args.output_base, region)
-        region_args.append((region, input_dir, output_dir, args.seq_len, args.pred_len, args.step))
+        region_args.append((region, input_dir, output_dir, args.seq_len, args.pred_len, args.step, args.min_points))
 
     # 지역 병렬 처리
     all_stats = {}
@@ -466,6 +484,7 @@ def main():
     print("=" * 60)
 
     summary = {
+        'version': 'v11',
         'regions': list(all_stats.keys()),
         'total_files': total_files,
         'total_processed': total_processed,
@@ -473,6 +492,7 @@ def main():
         'seq_len': args.seq_len,
         'pred_len': args.pred_len,
         'step': args.step,
+        'min_points': args.min_points,
         'region_stats': all_stats
     }
 
