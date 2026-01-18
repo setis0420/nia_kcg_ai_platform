@@ -196,6 +196,73 @@ Epoch  50 | Train: 0.012345 | Val: 0.015678
 60분 후: 1.78 km
 ```
 
+## 추론 및 시각화
+
+### 배포용 파일 구조
+
+```
+배포용_V10/
+├── trajectory_predictor.py       # V10 예측기 클래스
+├── trajectory_predictor_v11.py   # V11 예측기 클래스
+├── generate_all_predictions.py   # 30분 간격 HTML 일괄 생성
+├── test_inference_v11_ulsan.py   # 단일 선박 테스트
+├── test_inference_v11_specific_time.py  # 특정 시간 기준 테스트
+├── test_inference_v11_all_ships.py      # 전체 선박 테스트
+├── test_inference_v11_all_ships_v2.py   # 인터랙티브 HTML (클릭 시 경로 표시)
+├── models/v11/울산/model_best.pth       # 학습된 모델
+├── sample_trj_ulsan_20210113.csv        # 테스트 데이터
+└── 예측결과/                            # 생성된 HTML 파일
+    ├── index.html                       # 네비게이션 페이지
+    ├── prediction_0030.html             # 00:30 예측
+    ├── prediction_0100.html             # 01:00 예측
+    └── ...                              # ~ 23:30 (총 47개)
+```
+
+### generate_all_predictions.py
+
+30분 간격으로 하루 전체의 예측 HTML 파일을 일괄 생성합니다.
+
+#### 실행 방법
+
+```bash
+python generate_all_predictions.py
+```
+
+#### 생성 결과
+
+- **시간 범위**: 00:30 ~ 23:30 (30분 간격, 47개 파일)
+- **출력 폴더**: `배포용_V10/예측결과/`
+- **파일 형식**: `prediction_HHMM.html` (예: prediction_1130.html)
+- **인덱스 페이지**: `index.html` (전체 시간대 네비게이션)
+
+#### HTML 기능
+
+- 해당 시간대 **5노트 이상** 선박 위치 표시 (방향 아이콘)
+- 선박 클릭 시:
+  - **파란색**: 과거 30분 실제 경로
+  - **빨간색**: 60분 예측 경로
+  - **초록색**: 60분 실제 경로 (비교용)
+- MMSI 및 평균 예측 오차 표시
+
+#### 주요 설정
+
+```python
+# generate_all_predictions.py 내 설정
+MIN_SOG = 5.0        # 최소 속력 (노트)
+SEQ_LEN = 30         # 입력 시퀀스 (분)
+PRED_LEN = 60        # 예측 시퀀스 (분)
+```
+
+### 단일 시간 테스트
+
+```bash
+# 특정 시간 기준 예측 (test_inference_v11_specific_time.py)
+python test_inference_v11_specific_time.py
+
+# 인터랙티브 HTML 생성 (test_inference_v11_all_ships_v2.py)
+python test_inference_v11_all_ships_v2.py
+```
+
 ## 요구사항
 
 ```
@@ -204,4 +271,5 @@ torch >= 1.12
 pandas >= 1.4
 numpy >= 1.21
 tqdm
+folium (시각화용)
 ```
