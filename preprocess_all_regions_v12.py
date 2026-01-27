@@ -32,11 +32,13 @@ from functools import partial
 # ============================================
 BASE_INPUT_DIR = r"K:\coding_project\NIA_선박항적예측프로그램\학습데이터"
 BASE_OUTPUT_DIR = r"K:\coding_project\NIA_선박항적예측프로그램\학습데이터_전처리\v12"
+MODELS_DIR = r"K:\coding_project\NIA_선박항적예측프로그램\배포용_V12\models"
 
 DEFAULT_SEQ_LEN = 30    # 입력 시퀀스 길이 (30분)
 DEFAULT_PRED_LEN = 60   # 예측 시퀀스 길이 (60분)
 DEFAULT_STEP = 15       # 슬라이딩 윈도우 스텝
 MIN_POINTS = 30         # 보간 후 최소 포인트 수
+TRACK_GRID_RESOLUTION = 0.01  # 항적 그리드 해상도 (도, ~1km)
 
 
 # ============================================
@@ -428,6 +430,131 @@ def process_region(region_name, input_dir, output_dir, seq_len=30, pred_len=60, 
 
 
 # ============================================
+# 과거 항적 그리드 생성 (V13용)
+# ============================================
+def build_track_grid_from_sequences(output_dir, region_name, grid_resolution=TRACK_GRID_RESOLUTION):
+    """
+    전처리된 시퀀스에서 과거 항적 그리드 생성
+
+    Args:
+        output_dir: 전처리된 시퀀스 폴더 (sequences_chunk_*.pkl)
+        region_name: 지역명
+        grid_resolution: 그리드 해상도 (도)
+
+    Returns:
+        dict: 생성된 그리드 정보
+    """
+    from collections import defaultdict
+
+    print(f"\n[V13 Track Grid] {region_name} 항적 그리드 생성 중...")
+
+    # 시퀀스 파일 로드
+    pkl_files = sorted(glob.glob(os.path.join(output_dir, 'sequences_chunk_*.pkl')))
+
+    if not pkl_files:
+        print(f"  [경고] 시퀀스 파일 없음: {output_dir}")
+        return None
+
+    direction_grid = defaultdict(list)  # {(grid_lat, grid_lon): [cog1, cog2, ...]}
+    count_grid = defaultdict(int)
+
+    total_points = 0
+
+    for pkl_file in tqdm(pkl_files, desc=f"  {region_name} 로드"):
+        try:
+            with open(pkl_file, 'rb') as f:
+                sequences = pickle.load(f)
+
+            # 모든 시퀀스 처리 (10% 샘플링 -> 100%로 변경)
+            for seq in sequences:
+                if 'input' not in seq:
+                    continue
+
+                # input: (30, 4) - [lat, lon, sog, cog]
+                points = seq['input']
+
+                for i in range(len(points) - 1):
+                    lat, lon = points[i, 0], points[i, 1]
+
+                    # 이동 방향 계산
+                    dlat = points[i+1, 0] - points[i, 0]
+                    dlon = points[i+1, 1] - points[i, 1]
+
+                    if abs(dlat) > 1e-6 or abs(dlon) > 1e-6:
+                        cog = np.degrees(np.arctan2(dlon, dlat)) % 360
+
+                        # 그리드 키 계산
+                        grid_lat = round(lat / grid_resolution) * grid_resolution
+                        grid_lon = round(lon / grid_resolution) * grid_resolution
+                        grid_key = (grid_lat, grid_lon)
+
+                        direction_grid[grid_key].append(cog)
+                        count_grid[grid_key] += 1
+                        total_points += 1
+
+        except Exception as e:
+            continue
+
+    # 그리드별 평균 방향 계산 (원형 평균)
+    mean_direction = {}
+
+    for grid_key, cogs in direction_grid.items():
+        if len(cogs) < 3:  # 최소 3개 이상
+            continue
+
+        # 원형 평균 계산
+        cog_rad = np.radians(cogs)
+        mean_sin = np.mean(np.sin(cog_rad))
+        mean_cos = np.mean(np.cos(cog_rad))
+        mean_cog = np.degrees(np.arctan2(mean_sin, mean_cos)) % 360
+
+        # 방향 일관성 (원형 분산)
+        r = np.sqrt(mean_sin**2 + mean_cos**2)  # 0~1, 1이면 방향이 일관됨
+
+        if r > 0.3:  # 일관성 있는 방향만 저장
+            mean_direction[grid_key] = {
+                'cog': mean_cog,
+                'consistency': r,
+                'count': len(cogs)
+            }
+
+    print(f"  -> 총 {total_points:,}개 포인트, {len(mean_direction):,}개 유효 그리드")
+
+    # 그리드 데이터 반환
+    return {
+        'grid_resolution': grid_resolution,
+        'mean_direction': mean_direction,
+        'count_grid': dict(count_grid)
+    }
+
+
+def save_track_grid(grid_data, region_name, models_dir=MODELS_DIR):
+    """
+    항적 그리드를 models 폴더에 저장
+
+    Args:
+        grid_data: build_track_grid_from_sequences() 결과
+        region_name: 지역명
+        models_dir: 모델 폴더 경로
+    """
+    if grid_data is None:
+        return None
+
+    # 지역별 models 폴더 경로
+    region_model_dir = os.path.join(models_dir, region_name)
+    os.makedirs(region_model_dir, exist_ok=True)
+
+    # track_grid.pkl 저장
+    grid_path = os.path.join(region_model_dir, 'track_grid.pkl')
+
+    with open(grid_path, 'wb') as f:
+        pickle.dump(grid_data, f)
+
+    print(f"  -> 저장: {grid_path}")
+    return grid_path
+
+
+# ============================================
 # 메인
 # ============================================
 def main():
@@ -446,6 +573,10 @@ def main():
                         help=f'최소 포인트 수 (기본: {MIN_POINTS})')
     parser.add_argument('--workers', type=int, default=4,
                         help='병렬 처리 워커 수 (기본: 4)')
+    parser.add_argument('--skip-track-grid', action='store_true',
+                        help='V13용 track_grid 생성 건너뛰기')
+    parser.add_argument('--track-grid-only', action='store_true',
+                        help='전처리 건너뛰고 track_grid만 생성')
     args = parser.parse_args()
 
     # 지역 목록 확인
@@ -465,7 +596,13 @@ def main():
 
     # 처리할 지역
     if args.regions:
-        regions = args.regions
+        # 쉼표로 구분된 경우 처리
+        regions = []
+        for r in args.regions:
+            if ',' in r:
+                regions.extend([x.strip() for x in r.split(',')])
+            else:
+                regions.append(r)
     else:
         regions = available_regions
 
@@ -474,37 +611,64 @@ def main():
     print("=" * 60)
     print(f"입력: {BASE_INPUT_DIR}")
     print(f"출력: {BASE_OUTPUT_DIR}")
+    print(f"모델: {MODELS_DIR}")
     print(f"설정: {args.seq_len}분 입력 → {args.pred_len}분 예측")
     print(f"선종: {SHIPTYPE_NAMES}")
     print(f"길이: {LENGTH_NAMES}")
     print(f"지역: {regions}")
+    if args.track_grid_only:
+        print(f"모드: Track Grid만 생성")
+    elif args.skip_track_grid:
+        print(f"모드: Track Grid 생성 건너뛰기")
+    else:
+        print(f"모드: 전처리 + Track Grid 생성")
     print("=" * 60)
 
     # 각 지역 처리
     all_stats = []
+    track_grid_results = []
+
     for region in regions:
         input_dir = os.path.join(BASE_INPUT_DIR, region)
         output_dir = os.path.join(BASE_OUTPUT_DIR, region)
 
-        if not os.path.exists(input_dir):
-            print(f"\n[경고] {region} 폴더가 없습니다: {input_dir}")
-            continue
+        # 전처리 수행 (track_grid_only가 아닐 때만)
+        if not args.track_grid_only:
+            if not os.path.exists(input_dir):
+                print(f"\n[경고] {region} 폴더가 없습니다: {input_dir}")
+                continue
 
-        stats = process_region(
-            region, input_dir, output_dir,
-            seq_len=args.seq_len,
-            pred_len=args.pred_len,
-            step=args.step,
-            min_points=args.min_points,
-            n_workers=args.workers
-        )
-        if stats:
-            all_stats.append(stats)
+            stats = process_region(
+                region, input_dir, output_dir,
+                seq_len=args.seq_len,
+                pred_len=args.pred_len,
+                step=args.step,
+                min_points=args.min_points,
+                n_workers=args.workers
+            )
+            if stats:
+                all_stats.append(stats)
+
+        # Track Grid 생성 (skip_track_grid가 아닐 때)
+        if not args.skip_track_grid:
+            # track_grid_only 모드에서는 output_dir 존재 여부 확인
+            if args.track_grid_only and not os.path.exists(output_dir):
+                print(f"\n[경고] {region} 전처리 폴더가 없습니다: {output_dir}")
+                continue
+
+            grid_data = build_track_grid_from_sequences(output_dir, region)
+            if grid_data:
+                grid_path = save_track_grid(grid_data, region)
+                track_grid_results.append({
+                    'region': region,
+                    'grids': len(grid_data['mean_direction']),
+                    'path': grid_path
+                })
 
     # 최종 요약
     if all_stats:
         print("\n" + "=" * 60)
-        print("전체 요약")
+        print("전처리 요약")
         print("=" * 60)
         total_files = sum(s['total_files'] for s in all_stats)
         total_processed = sum(s['processed_files'] for s in all_stats)
@@ -516,6 +680,16 @@ def main():
             print(f"{s['region']:<15} {s['total_files']:>12,} {s['processed_files']:>12,} {s['total_sequences']:>15,}")
         print("-" * 55)
         print(f"{'합계':<15} {total_files:>12,} {total_processed:>12,} {total_sequences:>15,}")
+
+    # Track Grid 요약
+    if track_grid_results:
+        print("\n" + "=" * 60)
+        print("V13 Track Grid 생성 요약")
+        print("=" * 60)
+        print(f"{'지역':<15} {'유효 그리드':>12} {'저장 경로'}")
+        print("-" * 70)
+        for r in track_grid_results:
+            print(f"{r['region']:<15} {r['grids']:>12,} {r['path']}")
 
     print("\n완료!")
 
