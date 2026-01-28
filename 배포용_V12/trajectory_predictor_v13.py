@@ -63,140 +63,318 @@ REGION_BOUNDS = {
 
 
 # ============================================
-# 수심 체크 클래스
+# 수심 체크 클래스 (450m 고해상도 NC 파일 지원)
 # ============================================
 
 class DepthChecker:
-    """수심 데이터 기반 항해 가능 영역 체크"""
+    """
+    수심 데이터 기반 항해 가능 영역 체크
+    - 450m 해상도 NC 파일 (depth_450m_*.nc) 지원
+    - 직접 격자 인덱싱으로 빠른 조회
+    """
 
-    MIN_DEPTH = 10.0  # 최소 수심 (m)
-    LAND_VALUE = -99999.0  # 육지 값
+    MIN_DEPTH = 10.0  # 최소 수심 (m) - 이 값 이상이어야 항해 가능
 
     def __init__(self, depth_file=None, region=None):
         """
         Args:
-            depth_file: 수심 CSV 파일 경로
-            region: 지역명 (울산, 인천 등) - 해당 지역만 로드
+            depth_file: 수심 NC 파일 경로 (None이면 자동 탐색)
+            region: 지역명 (울산, 인천 등) - 메모리 최적화용
         """
-        if depth_file is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            depth_file = os.path.join(base_dir, "depth_0.025deg_value.csv")
-
         self.depth_file = depth_file
         self.region = region
-        self.grid_data = None
-        self.kdtree = None
-        self.coords = None
-        self.depths = None
-        self.grid_resolution = 0.025  # 그리드 해상도 (도)
+        self.elevation = None  # 2D numpy array (lat, lon)
+        self.lat_arr = None    # 1D array
+        self.lon_arr = None    # 1D array
+        self.lat_min = None
+        self.lat_max = None
+        self.lon_min = None
+        self.lon_max = None
+        self.lat_res = None    # 위도 해상도
+        self.lon_res = None    # 경도 해상도
+        self.loaded = False
 
-        self._load_depth_data()
+        self._find_and_load_depth_file()
 
-    def _load_depth_data(self):
-        """수심 데이터 로드 (지역 필터링)"""
-        if not os.path.exists(self.depth_file):
-            print(f"[경고] 수심 파일 없음: {self.depth_file}")
+    def _find_and_load_depth_file(self):
+        """수심 파일 찾기 및 로드"""
+        if self.depth_file and os.path.exists(self.depth_file):
+            self._load_nc_file(self.depth_file)
             return
 
-        print(f"[V13] 수심 데이터 로드 중... (지역: {self.region or '전체'})")
-        df = pd.read_csv(self.depth_file)
+        # 자동 탐색
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        search_paths = [
+            os.path.join(base_dir, "depth_450m_s27.0_w119.0_e137.0.nc"),
+            os.path.join(base_dir, "depth_450m.nc"),
+        ]
 
-        # 지역별 필터링
+        for path in search_paths:
+            if os.path.exists(path):
+                self._load_nc_file(path)
+                return
+
+        print(f"[V13] 수심 NC 파일을 찾을 수 없습니다.")
+        print(f"      검색 경로: {search_paths}")
+
+    def _load_nc_file(self, filepath):
+        """NC 파일 로드 (지역별 부분 로드)"""
+        try:
+            from netCDF4 import Dataset
+        except ImportError:
+            print("[V13] netCDF4 모듈이 없습니다. pip install netCDF4 실행 필요")
+            return
+
+        print(f"[V13] 수심 NC 파일 로드 중... (지역: {self.region or '전체'})")
+
+        nc = Dataset(filepath, 'r')
+
+        # 좌표 배열 로드
+        full_lat = nc.variables['lat'][:]
+        full_lon = nc.variables['lon'][:]
+
+        # 지역별 필터링 (메모리 절약)
         if self.region and self.region in REGION_BOUNDS:
             bounds = REGION_BOUNDS[self.region]
-            df = df[
-                (df['cen_y'] >= bounds['lat_min']) & (df['cen_y'] <= bounds['lat_max']) &
-                (df['cen_x'] >= bounds['lon_min']) & (df['cen_x'] <= bounds['lon_max'])
-            ]
-            print(f"[V13] {self.region} 지역 필터링: {len(df):,}개 그리드")
+            # 여유 범위 추가 (0.5도)
+            lat_min = bounds['lat_min'] - 0.5
+            lat_max = bounds['lat_max'] + 0.5
+            lon_min = bounds['lon_min'] - 0.5
+            lon_max = bounds['lon_max'] + 0.5
 
-        # 좌표와 수심 추출
-        self.coords = df[['cen_y', 'cen_x']].values  # (lat, lon)
-        self.depths = df['depth'].values
+            # 인덱스 범위 계산
+            lat_idx = np.where((full_lat >= lat_min) & (full_lat <= lat_max))[0]
+            lon_idx = np.where((full_lon >= lon_min) & (full_lon <= lon_max))[0]
 
-        # KDTree 생성 (빠른 최근접 이웃 검색)
-        self.kdtree = cKDTree(self.coords)
+            if len(lat_idx) == 0 or len(lon_idx) == 0:
+                print(f"[V13] 경고: {self.region} 지역에 해당하는 수심 데이터 없음")
+                nc.close()
+                return
 
-        # 항해 가능 영역 마스크 (depth >= 10m)
-        self.navigable_mask = (self.depths >= self.MIN_DEPTH) & (self.depths != self.LAND_VALUE)
+            lat_start, lat_end = lat_idx[0], lat_idx[-1] + 1
+            lon_start, lon_end = lon_idx[0], lon_idx[-1] + 1
 
-        print(f"[V13] 수심 데이터 로드 완료: {len(self.coords):,}개 그리드")
-        print(f"      항해 가능 영역: {self.navigable_mask.sum():,}개 ({100*self.navigable_mask.mean():.1f}%)")
+            self.lat_arr = full_lat[lat_start:lat_end]
+            self.lon_arr = full_lon[lon_start:lon_end]
+            self.elevation = nc.variables['elevation'][lat_start:lat_end, lon_start:lon_end]
+        else:
+            self.lat_arr = full_lat[:]
+            self.lon_arr = full_lon[:]
+            self.elevation = nc.variables['elevation'][:, :]
+
+        nc.close()
+
+        # numpy array로 변환
+        self.lat_arr = np.array(self.lat_arr)
+        self.lon_arr = np.array(self.lon_arr)
+        self.elevation = np.array(self.elevation, dtype=np.float32)
+
+        # 범위 및 해상도 저장
+        self.lat_min = float(self.lat_arr[0])
+        self.lat_max = float(self.lat_arr[-1])
+        self.lon_min = float(self.lon_arr[0])
+        self.lon_max = float(self.lon_arr[-1])
+
+        if len(self.lat_arr) > 1:
+            self.lat_res = float(self.lat_arr[1] - self.lat_arr[0])
+        if len(self.lon_arr) > 1:
+            self.lon_res = float(self.lon_arr[1] - self.lon_arr[0])
+
+        self.loaded = True
+
+        # 통계 출력
+        land_count = np.sum(self.elevation >= 0)
+        shallow_count = np.sum((self.elevation < 0) & (self.elevation > -self.MIN_DEPTH))
+        navigable_count = np.sum(self.elevation <= -self.MIN_DEPTH)
+        total = self.elevation.size
+
+        print(f"[V13] 수심 데이터 로드 완료:")
+        print(f"      격자: {self.elevation.shape[0]} x {self.elevation.shape[1]} ({total:,}개)")
+        print(f"      해상도: {abs(self.lat_res)*111*1000:.0f}m x {abs(self.lon_res)*111*1000:.0f}m")
+        print(f"      위도: {self.lat_min:.3f} ~ {self.lat_max:.3f}")
+        print(f"      경도: {self.lon_min:.3f} ~ {self.lon_max:.3f}")
+        print(f"      육지: {land_count:,}개 ({100*land_count/total:.1f}%)")
+        print(f"      얕은물(<{self.MIN_DEPTH}m): {shallow_count:,}개 ({100*shallow_count/total:.1f}%)")
+        print(f"      항해가능(>={self.MIN_DEPTH}m): {navigable_count:,}개 ({100*navigable_count/total:.1f}%)")
+
+    def _get_indices(self, lat, lon):
+        """좌표를 격자 인덱스로 변환"""
+        if not self.loaded:
+            return None, None
+
+        # 범위 체크
+        if lat < self.lat_min or lat > self.lat_max:
+            return None, None
+        if lon < self.lon_min or lon > self.lon_max:
+            return None, None
+
+        # 인덱스 계산 (직접 계산 - 빠름)
+        lat_idx = int(round((lat - self.lat_min) / self.lat_res))
+        lon_idx = int(round((lon - self.lon_min) / self.lon_res))
+
+        # 경계 체크
+        lat_idx = max(0, min(lat_idx, len(self.lat_arr) - 1))
+        lon_idx = max(0, min(lon_idx, len(self.lon_arr) - 1))
+
+        return lat_idx, lon_idx
 
     def get_depth(self, lat, lon):
-        """특정 좌표의 수심 반환"""
-        if self.kdtree is None:
+        """
+        특정 좌표의 수심 반환
+
+        Returns:
+            float: 수심 (음수 = 바다, 양수 = 육지) 또는 None
+        """
+        lat_idx, lon_idx = self._get_indices(lat, lon)
+        if lat_idx is None:
             return None
 
-        _, idx = self.kdtree.query([lat, lon])
-        return self.depths[idx]
+        elev = self.elevation[lat_idx, lon_idx]
+
+        # 양수 = 육지 높이, 음수 = 수심
+        # 반환: 음수로 통일 (수심), 육지는 양수 그대로
+        return float(elev)
 
     def is_navigable(self, lat, lon, check_neighbors=True):
         """
-        항해 가능 여부 확인 (depth >= 10m)
+        항해 가능 여부 확인
+
+        - elevation >= 0: 육지 (항해 불가)
+        - -MIN_DEPTH < elevation < 0: 얕은 물 (항해 불가)
+        - elevation <= -MIN_DEPTH: 항해 가능
 
         Args:
             lat, lon: 좌표
-            check_neighbors: True면 주변 그리드도 확인 (육지 근접 감지)
+            check_neighbors: True면 주변 격자도 확인 (육지 근접 감지)
         """
-        if self.kdtree is None:
+        if not self.loaded:
             return True  # 수심 데이터 없으면 통과
 
-        _, idx = self.kdtree.query([lat, lon])
+        lat_idx, lon_idx = self._get_indices(lat, lon)
+        if lat_idx is None:
+            return True  # 범위 밖은 통과
 
-        # 가장 가까운 그리드가 육지이면 False
-        if not self.navigable_mask[idx]:
+        elev = self.elevation[lat_idx, lon_idx]
+
+        # 현재 위치 체크 (수심 10m 이상이어야 함)
+        if elev > -self.MIN_DEPTH:  # 육지 또는 얕은 물
             return False
 
-        # 주변 그리드 확인 (육지 근접 감지)
+        # 주변 격자 확인 (육지 근접 감지)
         if check_neighbors:
-            # 가까운 4개 그리드 확인
-            distances, indices = self.kdtree.query([lat, lon], k=min(4, len(self.coords)))
-
-            # 육지 그리드가 있으면서 매우 가까우면 (0.03도 = ~3km 이내) 항해 불가
-            for dist, idx in zip(distances, indices):
-                if dist < 0.03 and self.depths[idx] == self.LAND_VALUE:
-                    return False
+            # 주변 3x3 격자 확인 (약 1.3km 범위)
+            for di in [-1, 0, 1]:
+                for dj in [-1, 0, 1]:
+                    if di == 0 and dj == 0:
+                        continue
+                    ni = lat_idx + di
+                    nj = lon_idx + dj
+                    if 0 <= ni < len(self.lat_arr) and 0 <= nj < len(self.lon_arr):
+                        if self.elevation[ni, nj] >= 0:  # 육지
+                            return False
 
         return True
 
-    def find_nearest_navigable(self, lat, lon, max_search_radius=0.1):
+    def is_land(self, lat, lon):
+        """육지 여부 확인 (elevation >= 0)"""
+        if not self.loaded:
+            return False
+
+        lat_idx, lon_idx = self._get_indices(lat, lon)
+        if lat_idx is None:
+            return False
+
+        return self.elevation[lat_idx, lon_idx] >= 0
+
+    def find_nearest_navigable(self, lat, lon, max_search_radius=0.05):
         """
         가장 가까운 항해 가능 지점 찾기
 
         Args:
             lat, lon: 현재 좌표
-            max_search_radius: 최대 검색 반경 (도)
+            max_search_radius: 최대 검색 반경 (도, 기본 ~5km)
 
         Returns:
             (lat, lon) 또는 None
         """
-        if self.kdtree is None:
+        if not self.loaded:
             return (lat, lon)
 
         # 현재 위치가 항해 가능하면 그대로 반환
-        _, idx = self.kdtree.query([lat, lon])
-        if self.navigable_mask[idx]:
+        if self.is_navigable(lat, lon, check_neighbors=False):
             return (lat, lon)
 
-        # 반경 내 항해 가능 지점 검색
-        indices = self.kdtree.query_ball_point([lat, lon], max_search_radius)
-
-        if not indices:
+        lat_idx, lon_idx = self._get_indices(lat, lon)
+        if lat_idx is None:
             return None
 
-        # 항해 가능한 지점 중 가장 가까운 것 찾기
-        navigable_indices = [i for i in indices if self.navigable_mask[i]]
+        # 나선형 검색 (가까운 곳부터)
+        search_steps = int(max_search_radius / abs(self.lat_res)) + 1
 
-        if not navigable_indices:
-            return None
+        for radius in range(1, search_steps + 1):
+            candidates = []
 
-        # 가장 가까운 항해 가능 지점
-        distances = [np.sqrt((self.coords[i, 0] - lat)**2 + (self.coords[i, 1] - lon)**2)
-                     for i in navigable_indices]
-        nearest_idx = navigable_indices[np.argmin(distances)]
+            # 정사각형 테두리 검색
+            for di in range(-radius, radius + 1):
+                for dj in range(-radius, radius + 1):
+                    # 테두리만 검색 (이전 반경은 이미 검색함)
+                    if abs(di) != radius and abs(dj) != radius:
+                        continue
 
-        return (self.coords[nearest_idx, 0], self.coords[nearest_idx, 1])
+                    ni = lat_idx + di
+                    nj = lon_idx + dj
+
+                    if 0 <= ni < len(self.lat_arr) and 0 <= nj < len(self.lon_arr):
+                        if self.elevation[ni, nj] <= -self.MIN_DEPTH:
+                            # 항해 가능 지점 발견
+                            nav_lat = self.lat_arr[ni]
+                            nav_lon = self.lon_arr[nj]
+                            dist = np.sqrt((nav_lat - lat)**2 + (nav_lon - lon)**2)
+                            candidates.append((dist, nav_lat, nav_lon))
+
+            if candidates:
+                # 가장 가까운 것 반환
+                candidates.sort(key=lambda x: x[0])
+                return (float(candidates[0][1]), float(candidates[0][2]))
+
+        return None
+
+    def get_depth_grid_for_display(self, region=None):
+        """
+        시각화용 수심 격자 데이터 반환 (육지 + 얕은 물만)
+
+        Returns:
+            list: [{'lat': ..., 'lon': ..., 'depth': ..., 'type': 'land'/'shallow'}, ...]
+        """
+        if not self.loaded:
+            return []
+
+        grids = []
+
+        # 샘플링 (너무 많으면 HTML이 느려짐)
+        # 450m 해상도는 너무 촘촘하므로 5~10배 샘플링
+        sample_step = max(1, min(len(self.lat_arr), len(self.lon_arr)) // 200)
+
+        for i in range(0, len(self.lat_arr), sample_step):
+            for j in range(0, len(self.lon_arr), sample_step):
+                elev = self.elevation[i, j]
+
+                if elev >= 0:  # 육지
+                    grids.append({
+                        'lat': float(self.lat_arr[i]),
+                        'lon': float(self.lon_arr[j]),
+                        'depth': float(elev),
+                        'type': 'land'
+                    })
+                elif elev > -self.MIN_DEPTH:  # 얕은 물
+                    grids.append({
+                        'lat': float(self.lat_arr[i]),
+                        'lon': float(self.lon_arr[j]),
+                        'depth': float(elev),
+                        'type': 'shallow'
+                    })
+
+        return grids
 
 
 # ============================================
