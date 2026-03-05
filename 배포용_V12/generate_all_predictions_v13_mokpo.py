@@ -129,14 +129,13 @@ class PredictorV13WithCorrection:
 
     def _init_corrector(self):
         """V13 보정기 초기화"""
-        # 수심 체커
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        depth_file = os.path.join(base_dir, "depth_0.025deg_value.csv")
-        self.depth_checker = DepthChecker(depth_file, region=self.region)
+        # 수심 체커 (NC 파일 자동 탐색)
+        self.depth_checker = DepthChecker(region=self.region)
 
         # 과거 항적 그리드
-        self.track_grid = HistoricalTrackGrid(grid_resolution=0.01)
-        track_grid_file = os.path.join(base_dir, f"track_grid_{self.region}.pkl")
+        self.track_grid = HistoricalTrackGrid(grid_resolution=0.0001)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        track_grid_file = os.path.join(script_dir, 'models', self.region, 'track_grid.pkl')
 
         if os.path.exists(track_grid_file):
             self.track_grid.load(track_grid_file)
@@ -193,12 +192,14 @@ class PredictorV13WithCorrection:
         original_coords[:, 0] = last_position[0] + pred_delta_real[:, 0]
         original_coords[:, 1] = last_position[1] + pred_delta_real[:, 1]
 
-        # 보정 적용
+        # 보정 적용 (선종/길이별 밀도 그리드 참조)
         if apply_correction and self.path_corrector is not None:
             corrected_coords = self.path_corrector.correct_path(
                 original_coords,
                 last_position,
-                last_cog=last_cog
+                last_cog=last_cog,
+                shiptype_cat=shiptype_cat,
+                length_cat=length_cat
             )
         else:
             corrected_coords = original_coords.copy()
@@ -772,13 +773,16 @@ def process_time_slot(df, predictor, base_time, min_sog=5.0):
 def main():
     base_dir = r"K:\coding_project\NIA_선박항적예측프로그램\배포용_V12"
     model_dir = os.path.join(base_dir, "models", "목포")
-    data_path = r"K:\coding_project\NIA_선박항적예측프로그램\배포용_V10\sample_trj_mokpo_20210113.csv"
+    data_path = r"K:\coding_project\NIA_선박항적예측프로그램\aisSample.parquet"
 
     output_dir = os.path.join(base_dir, "예측결과_v13_목포")
     os.makedirs(output_dir, exist_ok=True)
 
-    min_sog = 5.0
-    base_date = datetime(2021, 1, 13)
+    min_sog = 2.0
+    TIME_INTERVAL_MIN = 10  # 10분 간격
+
+    # 목포 지역 범위
+    MOKPO_BOUNDS = {'lat_min': 33.5, 'lat_max': 35.7, 'lon_min': 125.2, 'lon_max': 126.8}
 
     print("=" * 60)
     print("V13 목포 - 수심/항적 보정 적용 예측")
@@ -797,22 +801,36 @@ def main():
     depth_grids = load_depth_grids_for_display()
     print(f"수심 격자 (표시용): {len(depth_grids)}개")
 
-    # 데이터 로드
-    try:
-        df = pd.read_csv(data_path, encoding='utf-8')
-    except UnicodeDecodeError:
-        df = pd.read_csv(data_path, encoding='cp949')
+    # 데이터 로드 (parquet)
+    print("데이터 로드 중...")
+    df_all = pd.read_parquet(data_path)
+    df_all['datetime'] = pd.to_datetime(df_all['datetime'])
 
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    print(f"전체 데이터: {len(df)}개")
+    # 목포 지역 필터링
+    df_all = df_all[(df_all['lat'] >= MOKPO_BOUNDS['lat_min']) & (df_all['lat'] <= MOKPO_BOUNDS['lat_max']) &
+                    (df_all['lon'] >= MOKPO_BOUNDS['lon_min']) & (df_all['lon'] <= MOKPO_BOUNDS['lon_max'])]
 
-    # 30분 단위 시간대
-    time_slots = []
-    for hour in range(24):
-        for minute in [0, 30]:
-            if hour == 0 and minute == 0:
-                continue
-            time_slots.append(base_date + timedelta(hours=hour, minutes=minute))
+    # 날짜별 처리
+    df_all['date'] = df_all['datetime'].dt.date
+    unique_dates = sorted(df_all['date'].unique())
+    print(f"목포 지역 전체 데이터: {len(df_all):,}개")
+    print(f"처리할 날짜: {len(unique_dates)}개 - {unique_dates}")
+
+    # 모든 날짜에 대해 10분 간격 시간대 생성
+    all_time_slots = []
+    for target_date in unique_dates:
+        base_date = datetime(target_date.year, target_date.month, target_date.day)
+        for hour in range(24):
+            for minute in range(0, 60, TIME_INTERVAL_MIN):
+                if hour == 0 and minute == 0:
+                    continue
+                all_time_slots.append(base_date + timedelta(hours=hour, minutes=minute))
+
+    # 현재 날짜 데이터로 df 설정 (첫 번째 날짜)
+    df = df_all[df_all['date'] == unique_dates[-1]]  # 가장 많은 데이터가 있는 마지막 날짜
+    time_slots = [t for t in all_time_slots if t.date() == unique_dates[-1]]
+
+    print(f"처리 대상: {len(df):,}개, 선박 수: {df['mmsi'].nunique()}")
 
     print(f"생성할 시간대: {len(time_slots)}개\n")
 

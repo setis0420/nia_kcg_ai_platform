@@ -38,7 +38,7 @@ DEFAULT_SEQ_LEN = 30    # 입력 시퀀스 길이 (30분)
 DEFAULT_PRED_LEN = 60   # 예측 시퀀스 길이 (60분)
 DEFAULT_STEP = 15       # 슬라이딩 윈도우 스텝
 MIN_POINTS = 30         # 보간 후 최소 포인트 수
-TRACK_GRID_RESOLUTION = 0.01  # 항적 그리드 해상도 (도, ~1km)
+TRACK_GRID_RESOLUTION = 0.0015  # 항적 그리드 해상도 (도, ~150m)
 
 
 # ============================================
@@ -430,11 +430,14 @@ def process_region(region_name, input_dir, output_dir, seq_len=30, pred_len=60, 
 
 
 # ============================================
-# 과거 항적 그리드 생성 (V13용)
+# 과거 항적 밀도 그리드 생성 (V13용)
 # ============================================
 def build_track_grid_from_sequences(output_dir, region_name, grid_resolution=TRACK_GRID_RESOLUTION):
     """
-    전처리된 시퀀스에서 과거 항적 그리드 생성
+    전처리된 시퀀스에서 과거 항적 밀도 그리드 생성
+
+    밀도 기반: 각 격자에 통과한 포인트 수를 저장
+    - 예측 보정 시 밀도가 높은 쪽(실제 항로)으로 유도
 
     Args:
         output_dir: 전처리된 시퀀스 폴더 (sequences_chunk_*.pkl)
@@ -446,7 +449,7 @@ def build_track_grid_from_sequences(output_dir, region_name, grid_resolution=TRA
     """
     from collections import defaultdict
 
-    print(f"\n[V13 Track Grid] {region_name} 항적 그리드 생성 중...")
+    print(f"\n[V13 밀도 그리드] {region_name} 생성 중...")
 
     # 시퀀스 파일 로드
     pkl_files = sorted(glob.glob(os.path.join(output_dir, 'sequences_chunk_*.pkl')))
@@ -455,9 +458,7 @@ def build_track_grid_from_sequences(output_dir, region_name, grid_resolution=TRA
         print(f"  [경고] 시퀀스 파일 없음: {output_dir}")
         return None
 
-    direction_grid = defaultdict(list)  # {(grid_lat, grid_lon): [cog1, cog2, ...]}
-    count_grid = defaultdict(int)
-
+    count_grid = defaultdict(int)  # {(grid_lat, grid_lon): count}
     total_points = 0
 
     for pkl_file in tqdm(pkl_files, desc=f"  {region_name} 로드"):
@@ -465,7 +466,7 @@ def build_track_grid_from_sequences(output_dir, region_name, grid_resolution=TRA
             with open(pkl_file, 'rb') as f:
                 sequences = pickle.load(f)
 
-            # 모든 시퀀스 처리 (10% 샘플링 -> 100%로 변경)
+            # 모든 시퀀스의 모든 포인트 처리
             for seq in sequences:
                 if 'input' not in seq:
                     continue
@@ -473,58 +474,48 @@ def build_track_grid_from_sequences(output_dir, region_name, grid_resolution=TRA
                 # input: (30, 4) - [lat, lon, sog, cog]
                 points = seq['input']
 
-                for i in range(len(points) - 1):
+                for i in range(len(points)):
                     lat, lon = points[i, 0], points[i, 1]
 
-                    # 이동 방향 계산
-                    dlat = points[i+1, 0] - points[i, 0]
-                    dlon = points[i+1, 1] - points[i, 1]
+                    # 그리드 키 계산
+                    grid_lat = round(lat / grid_resolution) * grid_resolution
+                    grid_lon = round(lon / grid_resolution) * grid_resolution
+                    grid_key = (grid_lat, grid_lon)
 
-                    if abs(dlat) > 1e-6 or abs(dlon) > 1e-6:
-                        cog = np.degrees(np.arctan2(dlon, dlat)) % 360
+                    count_grid[grid_key] += 1
+                    total_points += 1
 
-                        # 그리드 키 계산
+                # target도 포함 (선택적)
+                if 'target' in seq:
+                    target_points = seq['target']
+                    for i in range(len(target_points)):
+                        lat, lon = target_points[i, 0], target_points[i, 1]
+
                         grid_lat = round(lat / grid_resolution) * grid_resolution
                         grid_lon = round(lon / grid_resolution) * grid_resolution
                         grid_key = (grid_lat, grid_lon)
 
-                        direction_grid[grid_key].append(cog)
                         count_grid[grid_key] += 1
                         total_points += 1
 
         except Exception as e:
             continue
 
-    # 그리드별 평균 방향 계산 (원형 평균)
-    mean_direction = {}
+    # 최대 밀도 계산
+    max_density = max(count_grid.values()) if count_grid else 1
 
-    for grid_key, cogs in direction_grid.items():
-        if len(cogs) < 3:  # 최소 3개 이상
-            continue
-
-        # 원형 평균 계산
-        cog_rad = np.radians(cogs)
-        mean_sin = np.mean(np.sin(cog_rad))
-        mean_cos = np.mean(np.cos(cog_rad))
-        mean_cog = np.degrees(np.arctan2(mean_sin, mean_cos)) % 360
-
-        # 방향 일관성 (원형 분산)
-        r = np.sqrt(mean_sin**2 + mean_cos**2)  # 0~1, 1이면 방향이 일관됨
-
-        if r > 0.3:  # 일관성 있는 방향만 저장
-            mean_direction[grid_key] = {
-                'cog': mean_cog,
-                'consistency': r,
-                'count': len(cogs)
-            }
-
-    print(f"  -> 총 {total_points:,}개 포인트, {len(mean_direction):,}개 유효 그리드")
+    # 통계 출력
+    densities = list(count_grid.values())
+    print(f"  -> 총 {total_points:,}개 포인트, {len(count_grid):,}개 격자")
+    print(f"  -> 밀도: 최소 {min(densities)}, 최대 {max_density:,}, 평균 {np.mean(densities):.0f}")
 
     # 그리드 데이터 반환
     return {
         'grid_resolution': grid_resolution,
-        'mean_direction': mean_direction,
-        'count_grid': dict(count_grid)
+        'count_grid': dict(count_grid),
+        'max_density': max_density,
+        # 레거시 호환용 (빈 값)
+        'mean_direction': {}
     }
 
 
@@ -661,7 +652,8 @@ def main():
                 grid_path = save_track_grid(grid_data, region)
                 track_grid_results.append({
                     'region': region,
-                    'grids': len(grid_data['mean_direction']),
+                    'grids': len(grid_data['count_grid']),
+                    'max_density': grid_data.get('max_density', 0),
                     'path': grid_path
                 })
 
@@ -684,12 +676,12 @@ def main():
     # Track Grid 요약
     if track_grid_results:
         print("\n" + "=" * 60)
-        print("V13 Track Grid 생성 요약")
+        print("V13 밀도 그리드 생성 요약")
         print("=" * 60)
-        print(f"{'지역':<15} {'유효 그리드':>12} {'저장 경로'}")
-        print("-" * 70)
+        print(f"{'지역':<10} {'격자 수':>12} {'최대 밀도':>12} {'저장 경로'}")
+        print("-" * 80)
         for r in track_grid_results:
-            print(f"{r['region']:<15} {r['grids']:>12,} {r['path']}")
+            print(f"{r['region']:<10} {r['grids']:>12,} {r['max_density']:>12,} {r['path']}")
 
     print("\n완료!")
 

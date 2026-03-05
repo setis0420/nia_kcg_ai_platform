@@ -73,7 +73,7 @@ class DepthChecker:
     - 직접 격자 인덱싱으로 빠른 조회
     """
 
-    MIN_DEPTH = 10.0  # 최소 수심 (m) - 이 값 이상이어야 항해 가능
+    MIN_DEPTH = 0.0  # 최소 수심 (m) - 0m = 모든 수역 항해 가능 (육지만 제외)
 
     def __init__(self, depth_file=None, region=None):
         """
@@ -127,7 +127,30 @@ class DepthChecker:
 
         print(f"[V13] 수심 NC 파일 로드 중... (지역: {self.region or '전체'})")
 
-        nc = Dataset(filepath, 'r')
+        # Windows에서 한글 경로 문제 해결
+        nc = None
+        original_cwd = os.getcwd()
+
+        # 방법 1: 작업 디렉토리 변경 후 파일명만으로 열기
+        try:
+            nc_dir = os.path.dirname(filepath)
+            nc_filename = os.path.basename(filepath)
+            if nc_dir:
+                os.chdir(nc_dir)
+            nc = Dataset(nc_filename, 'r')
+        except OSError:
+            pass
+        finally:
+            os.chdir(original_cwd)
+
+        # 방법 2: 직접 경로로 시도
+        if nc is None:
+            try:
+                nc = Dataset(filepath, 'r')
+            except OSError as e:
+                print(f"[V13] NC 파일 열기 실패: {e}")
+                print(f"      파일 경로: {filepath}")
+                return
 
         # 좌표 배열 로드
         full_lat = nc.variables['lat'][:]
@@ -378,22 +401,54 @@ class DepthChecker:
 
 
 # ============================================
-# 과거 항적 방향 분석 클래스
+# 과거 항적 밀도 그리드 클래스
 # ============================================
 
 class HistoricalTrackGrid:
-    """과거 항적 데이터 기반 그리드별 주요 이동 방향 분석"""
+    """
+    과거 항적 데이터 기반 그리드별 밀도 분석 (선종/길이별 분리)
 
-    def __init__(self, grid_resolution=0.01):
+    핵심 원리:
+    - 각 격자에 지나간 선박 수(밀도)를 선종/길이별로 저장
+    - 예측 경로 보정 시 동일 선종/길이의 밀도가 높은 쪽(실제 항로)으로 유도
+
+    구조:
+    - count_grid[shiptype_cat][length_cat][(lat, lon)] = count
+    - 5개 선종 × 9개 길이 = 45개 별도 그리드
+    """
+
+    NUM_SHIPTYPE = 5  # 화물선, 여객선, 유조선, 예부선, 기타선
+    NUM_LENGTH = 9    # 0-40m, 40-80m, ..., 320m+
+
+    def __init__(self, grid_resolution=0.0001):
         """
         Args:
-            grid_resolution: 그리드 해상도 (도), 기본 0.01도 ≈ 1km
+            grid_resolution: 그리드 해상도 (도), 기본 0.0001도 ≈ 11m
         """
         self.grid_resolution = grid_resolution
-        self.direction_grid = defaultdict(list)  # {(grid_lat, grid_lon): [cog1, cog2, ...]}
-        self.count_grid = defaultdict(int)  # {(grid_lat, grid_lon): count}
-        self.mean_direction = {}  # {(grid_lat, grid_lon): mean_cog}
+
+        # 선종/길이별 분리된 그리드 구조
+        # count_grid[shiptype_cat][length_cat] = defaultdict(int)
+        self.count_grid = {
+            st: {ln: defaultdict(int) for ln in range(self.NUM_LENGTH)}
+            for st in range(self.NUM_SHIPTYPE)
+        }
+
+        # 전체 통합 그리드 (fallback용)
+        self.count_grid_all = defaultdict(int)
+
+        self.max_density = {
+            st: {ln: 1 for ln in range(self.NUM_LENGTH)}
+            for st in range(self.NUM_SHIPTYPE)
+        }
+        self.max_density_all = 1
+
         self.loaded = False
+
+        # 레거시 호환 (기존 파일 로드용)
+        self.mean_direction = {}
+        self.direction_grid = defaultdict(list)
+        self.is_legacy = False  # 기존 단일 그리드 파일인지 여부
 
     def _get_grid_key(self, lat, lon):
         """좌표를 그리드 키로 변환"""
@@ -401,13 +456,183 @@ class HistoricalTrackGrid:
         grid_lon = round(lon / self.grid_resolution) * self.grid_resolution
         return (grid_lat, grid_lon)
 
+    def _get_line_grids(self, lat1, lon1, lat2, lon2):
+        """
+        두 점 사이의 선이 지나가는 모든 격자 반환 (Bresenham 알고리즘)
+
+        Args:
+            lat1, lon1: 시작점
+            lat2, lon2: 끝점
+
+        Returns:
+            set: 선이 지나가는 모든 격자 키 집합
+        """
+        grids = set()
+
+        # 격자 인덱스로 변환
+        res = self.grid_resolution
+        x0 = int(round(lon1 / res))
+        y0 = int(round(lat1 / res))
+        x1 = int(round(lon2 / res))
+        y1 = int(round(lat2 / res))
+
+        # Bresenham's line algorithm
+        dx = abs(x1 - x0)
+        dy = abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx - dy
+
+        while True:
+            # 현재 격자 추가
+            grid_lat = y0 * res
+            grid_lon = x0 * res
+            grids.add((grid_lat, grid_lon))
+
+            if x0 == x1 and y0 == y1:
+                break
+
+            e2 = 2 * err
+            if e2 > -dy:
+                err -= dy
+                x0 += sx
+            if e2 < dx:
+                err += dx
+                y0 += sy
+
+        return grids
+
+    def get_density(self, lat, lon, shiptype_cat=None, length_cat=None):
+        """
+        특정 위치의 밀도(통과 선박 수) 반환
+
+        Args:
+            lat, lon: 좌표
+            shiptype_cat: 선종 카테고리 (0-4), None이면 전체 통합
+            length_cat: 길이 카테고리 (0-8), None이면 전체 통합
+
+        Returns:
+            int: 해당 격자의 통과 선박 수 (0이면 항적 없음)
+        """
+        grid_key = self._get_grid_key(lat, lon)
+
+        # 레거시 모드 (기존 단일 그리드)
+        if self.is_legacy:
+            return self.count_grid_all.get(grid_key, 0)
+
+        # 선종/길이 지정된 경우 해당 그리드에서 조회
+        if shiptype_cat is not None and length_cat is not None:
+            st = max(0, min(shiptype_cat, self.NUM_SHIPTYPE - 1))
+            ln = max(0, min(length_cat, self.NUM_LENGTH - 1))
+            return self.count_grid[st][ln].get(grid_key, 0)
+
+        # 선종/길이 미지정시 전체 통합 그리드
+        return self.count_grid_all.get(grid_key, 0)
+
+    def get_normalized_density(self, lat, lon, shiptype_cat=None, length_cat=None):
+        """
+        정규화된 밀도 반환 (0~1)
+        """
+        density = self.get_density(lat, lon, shiptype_cat, length_cat)
+
+        if self.is_legacy:
+            max_d = self.max_density_all
+        elif shiptype_cat is not None and length_cat is not None:
+            st = max(0, min(shiptype_cat, self.NUM_SHIPTYPE - 1))
+            ln = max(0, min(length_cat, self.NUM_LENGTH - 1))
+            max_d = self.max_density[st][ln]
+        else:
+            max_d = self.max_density_all
+
+        if max_d > 0:
+            return min(density / max_d, 1.0)
+        return 0.0
+
+    def get_density_gradient(self, lat, lon, shiptype_cat=None, length_cat=None):
+        """
+        주변 격자 밀도 기반 끌어당김 벡터 계산
+
+        밀도가 높은 방향으로 향하는 벡터 반환
+
+        Args:
+            lat, lon: 좌표
+            shiptype_cat: 선종 카테고리 (0-4)
+            length_cat: 길이 카테고리 (0-8)
+
+        Returns:
+            (dlat, dlon, strength) or None
+            - dlat, dlon: 끌어당김 방향 (정규화됨)
+            - strength: 끌어당김 강도 (0~1)
+        """
+        if not self.loaded:
+            return None
+
+        res = self.grid_resolution
+        current_density = self.get_density(lat, lon, shiptype_cat, length_cat)
+
+        # 주변 8방향 격자 밀도 수집
+        neighbors = [
+            (res, 0),      # 북
+            (-res, 0),     # 남
+            (0, res),      # 동
+            (0, -res),     # 서
+            (res, res),    # 북동
+            (res, -res),   # 북서
+            (-res, res),   # 남동
+            (-res, -res),  # 남서
+        ]
+
+        # 밀도 가중 평균 방향 계산
+        total_weight = 0
+        weighted_dlat = 0
+        weighted_dlon = 0
+
+        for dlat, dlon in neighbors:
+            neighbor_density = self.get_density(lat + dlat, lon + dlon, shiptype_cat, length_cat)
+
+            # 현재보다 밀도가 높은 쪽으로만 끌어당김
+            if neighbor_density > current_density:
+                weight = neighbor_density - current_density
+
+                # 방향 정규화
+                dist = np.sqrt(dlat**2 + dlon**2)
+                weighted_dlat += (dlat / dist) * weight
+                weighted_dlon += (dlon / dist) * weight
+                total_weight += weight
+
+        if total_weight < 1:  # 의미 있는 기울기 없음
+            return None
+
+        # 정규화
+        magnitude = np.sqrt(weighted_dlat**2 + weighted_dlon**2)
+        if magnitude < 1e-9:
+            return None
+
+        # 강도: 주변 밀도 차이에 비례 (최대 밀도 대비)
+        if self.is_legacy:
+            max_d = self.max_density_all
+        elif shiptype_cat is not None and length_cat is not None:
+            st = max(0, min(shiptype_cat, self.NUM_SHIPTYPE - 1))
+            ln = max(0, min(length_cat, self.NUM_LENGTH - 1))
+            max_d = self.max_density[st][ln]
+        else:
+            max_d = self.max_density_all
+
+        strength = min(total_weight / (max_d + 1), 1.0)
+
+        return (weighted_dlat / magnitude, weighted_dlon / magnitude, strength)
+
     def load_from_training_data(self, data_dir, region=None):
         """
-        학습 데이터에서 과거 항적 방향 로드
+        학습 데이터에서 과거 항적 밀도 로드 (선종/길이별 분리)
 
         Args:
             data_dir: 전처리된 데이터 폴더
             region: 지역명 (선택)
+
+        Note:
+            학습 데이터에 shiptype_cat, length_cat이 있으면 분리 저장
+            없으면 전체 통합 그리드에만 저장
         """
         import pickle
         import glob
@@ -423,45 +648,83 @@ class HistoricalTrackGrid:
             print(f"[경고] 학습 데이터 없음: {search_path}")
             return
 
-        print(f"[V13] 과거 항적 데이터 로드 중... ({len(pkl_files)}개 파일)")
+        print(f"[V13] 과거 항적 밀도 로드 중... ({len(pkl_files)}개 파일)")
 
-        total_points = 0
+        total_segments = 0
+        total_grids = 0
+        category_counts = defaultdict(int)  # (st, ln) -> count
+
         for pkl_file in pkl_files:
             try:
                 with open(pkl_file, 'rb') as f:
                     sequences = pickle.load(f)
 
-                # 샘플링: 10%만 사용 (속도 향상)
-                sample_size = max(1, len(sequences) // 10)
-                sampled_seqs = sequences[::10][:sample_size * 3]
+                for seq in sequences:
+                    if 'input' not in seq:
+                        continue
 
-                for seq in sampled_seqs:
-                    if 'input' in seq:
-                        # input: (30, 4) - [lat, lon, sog, cog]
-                        points = seq['input']
-                        for i in range(len(points) - 1):
-                            lat, lon = points[i, 0], points[i, 1]
-                            # 이동 방향 계산
-                            dlat = points[i+1, 0] - points[i, 0]
-                            dlon = points[i+1, 1] - points[i, 1]
-                            if abs(dlat) > 1e-6 or abs(dlon) > 1e-6:
-                                cog = np.degrees(np.arctan2(dlon, dlat)) % 360
-                                grid_key = self._get_grid_key(lat, lon)
-                                self.direction_grid[grid_key].append(cog)
-                                self.count_grid[grid_key] += 1
-                                total_points += 1
+                    # input: (30, 4) - [lat, lon, sog, cog]
+                    points = seq['input']
+
+                    # 선종/길이 카테고리 가져오기 (없으면 None)
+                    shiptype_cat = seq.get('shiptype_cat', None)
+                    length_cat = seq.get('length_cat', None)
+
+                    # 연속 점들을 선으로 연결하여 지나는 모든 격자 카운트
+                    for i in range(len(points) - 1):
+                        lat1, lon1 = points[i, 0], points[i, 1]
+                        lat2, lon2 = points[i + 1, 0], points[i + 1, 1]
+
+                        # 선이 지나는 모든 격자
+                        line_grids = self._get_line_grids(lat1, lon1, lat2, lon2)
+
+                        for grid_key in line_grids:
+                            # 전체 통합 그리드에 추가
+                            self.count_grid_all[grid_key] += 1
+
+                            # 선종/길이별 그리드에도 추가
+                            if shiptype_cat is not None and length_cat is not None:
+                                st = max(0, min(int(shiptype_cat), self.NUM_SHIPTYPE - 1))
+                                ln = max(0, min(int(length_cat), self.NUM_LENGTH - 1))
+                                self.count_grid[st][ln][grid_key] += 1
+                                category_counts[(st, ln)] += 1
+
+                            total_grids += 1
+
+                        total_segments += 1
+
             except Exception as e:
                 continue
 
-        # 그리드별 평균 방향 계산
-        self._compute_mean_directions()
+        # 최대 밀도 계산
+        self._update_max_density()
         self.loaded = True
 
-        print(f"[V13] 과거 항적 로드 완료: {total_points:,}개 포인트, {len(self.mean_direction):,}개 그리드")
+        # 통계 출력
+        total_grids_by_cat = sum(
+            len(self.count_grid[st][ln])
+            for st in range(self.NUM_SHIPTYPE)
+            for ln in range(self.NUM_LENGTH)
+        )
+
+        print(f"[V13] 과거 항적 밀도 로드 완료 (선종/길이별 분리)")
+        print(f"      선분: {total_segments:,}개")
+        print(f"      전체 통합 그리드: {len(self.count_grid_all):,}개, 최대 밀도: {self.max_density_all:,}회")
+        print(f"      선종/길이별 그리드: {total_grids_by_cat:,}개")
+
+        # 카테고리별 상위 5개 출력
+        if category_counts:
+            sorted_cats = sorted(category_counts.items(), key=lambda x: -x[1])[:5]
+            print(f"      상위 카테고리:")
+            for (st, ln), cnt in sorted_cats:
+                st_name = SHIPTYPE_NAMES[st] if st < len(SHIPTYPE_NAMES) else f"선종{st}"
+                ln_name = LENGTH_NAMES[ln] if ln < len(LENGTH_NAMES) else f"길이{ln}"
+                max_d = self.max_density[st][ln]
+                print(f"        - {st_name}/{ln_name}: {cnt:,}회, 최대밀도: {max_d:,}")
 
     def load_from_raw_data(self, data_dir, region=None, sample_rate=0.1):
         """
-        원본 parquet/csv 파일에서 과거 항적 방향 로드
+        원본 parquet/csv 파일에서 과거 항적 밀도 로드
 
         Args:
             data_dir: 원본 데이터 폴더 (학습데이터/)
@@ -489,9 +752,10 @@ class HistoricalTrackGrid:
                                          size=max(1, int(len(all_files) * sample_rate)),
                                          replace=False)
 
-        print(f"[V13] 원본 항적 데이터 로드 중... ({len(sampled_files)}/{len(all_files)}개 파일)")
+        print(f"[V13] 원본 항적 밀도 로드 중... ({len(sampled_files)}/{len(all_files)}개 파일)")
 
-        total_points = 0
+        total_segments = 0
+        total_grids = 0
         for fpath in sampled_files:
             try:
                 if fpath.endswith('.parquet'):
@@ -502,30 +766,85 @@ class HistoricalTrackGrid:
                 if 'lat' not in df.columns or 'lon' not in df.columns:
                     continue
 
-                df = df.sort_values('datetime').reset_index(drop=True)
+                # 시간순 정렬 (datetime 컬럼이 있으면)
+                if 'datetime' in df.columns:
+                    df = df.sort_values('datetime')
 
-                for i in range(len(df) - 1):
-                    lat, lon = df.iloc[i]['lat'], df.iloc[i]['lon']
-                    dlat = df.iloc[i+1]['lat'] - lat
-                    dlon = df.iloc[i+1]['lon'] - lon
+                # 선종/길이 카테고리 (파일에 있으면 사용)
+                has_shiptype = 'shiptype' in df.columns
+                has_length = 'length' in df.columns
 
-                    if abs(dlat) > 1e-6 or abs(dlon) > 1e-6:
-                        cog = np.degrees(np.arctan2(dlon, dlat)) % 360
-                        grid_key = self._get_grid_key(lat, lon)
-                        self.direction_grid[grid_key].append(cog)
-                        self.count_grid[grid_key] += 1
-                        total_points += 1
+                # MMSI별 그룹화 (있으면)
+                if 'mmsi' in df.columns:
+                    for mmsi, group in df.groupby('mmsi'):
+                        coords = group[['lat', 'lon']].values
+
+                        # 선종/길이 카테고리 계산
+                        shiptype_cat = None
+                        length_cat = None
+                        if has_shiptype:
+                            st = group['shiptype'].iloc[0]
+                            shiptype_cat = get_shiptype_category(st)
+                        if has_length:
+                            ln = group['length'].iloc[0]
+                            length_cat = get_length_category(ln)
+
+                        for i in range(len(coords) - 1):
+                            lat1, lon1 = coords[i]
+                            lat2, lon2 = coords[i + 1]
+                            line_grids = self._get_line_grids(lat1, lon1, lat2, lon2)
+                            for grid_key in line_grids:
+                                # 전체 통합 그리드에 추가
+                                self.count_grid_all[grid_key] += 1
+
+                                # 선종/길이별 그리드에도 추가
+                                if shiptype_cat is not None and length_cat is not None:
+                                    st = max(0, min(int(shiptype_cat), self.NUM_SHIPTYPE - 1))
+                                    ln = max(0, min(int(length_cat), self.NUM_LENGTH - 1))
+                                    self.count_grid[st][ln][grid_key] += 1
+
+                                total_grids += 1
+                            total_segments += 1
+                else:
+                    # MMSI 없으면 전체를 하나의 궤적으로 (전체 통합만)
+                    coords = df[['lat', 'lon']].values
+                    for i in range(len(coords) - 1):
+                        lat1, lon1 = coords[i]
+                        lat2, lon2 = coords[i + 1]
+                        line_grids = self._get_line_grids(lat1, lon1, lat2, lon2)
+                        for grid_key in line_grids:
+                            self.count_grid_all[grid_key] += 1
+                            total_grids += 1
+                        total_segments += 1
 
             except Exception as e:
                 continue
 
-        self._compute_mean_directions()
+        self._update_max_density()
         self.loaded = True
 
-        print(f"[V13] 원본 항적 로드 완료: {total_points:,}개 포인트, {len(self.mean_direction):,}개 그리드")
+        print(f"[V13] 원본 항적 밀도 로드 완료: {total_segments:,}개 선분, {len(self.count_grid_all):,}개 그리드")
+        print(f"      총 격자 카운트: {total_grids:,}회, 최대 밀도: {self.max_density_all:,}회")
+
+    def _update_max_density(self):
+        """최대 밀도 계산 (선종/길이별 + 전체)"""
+        # 전체 통합 그리드
+        if self.count_grid_all:
+            self.max_density_all = max(self.count_grid_all.values())
+        else:
+            self.max_density_all = 1
+
+        # 선종/길이별 그리드
+        for st in range(self.NUM_SHIPTYPE):
+            for ln in range(self.NUM_LENGTH):
+                grid = self.count_grid[st][ln]
+                if grid:
+                    self.max_density[st][ln] = max(grid.values())
+                else:
+                    self.max_density[st][ln] = 1
 
     def _compute_mean_directions(self):
-        """그리드별 평균 방향 계산 (원형 평균)"""
+        """레거시: 그리드별 평균 방향 계산 (원형 평균) - 호환성용"""
         for grid_key, cogs in self.direction_grid.items():
             if len(cogs) < 3:  # 최소 3개 이상
                 continue
@@ -560,18 +879,41 @@ class HistoricalTrackGrid:
         return self.mean_direction.get(grid_key)
 
     def save(self, filepath):
-        """그리드 데이터 저장"""
+        """밀도 그리드 데이터 저장 (선종/길이별 분리 구조)"""
         import pickle
+
+        # 선종/길이별 그리드를 저장 가능한 형태로 변환
+        count_grid_serializable = {
+            st: {ln: dict(self.count_grid[st][ln]) for ln in range(self.NUM_LENGTH)}
+            for st in range(self.NUM_SHIPTYPE)
+        }
+
         with open(filepath, 'wb') as f:
             pickle.dump({
+                'version': 2,  # 새 버전 표시
                 'grid_resolution': self.grid_resolution,
-                'mean_direction': self.mean_direction,
-                'count_grid': dict(self.count_grid)
+                'count_grid': count_grid_serializable,  # 선종/길이별
+                'count_grid_all': dict(self.count_grid_all),  # 전체 통합
+                'max_density': self.max_density,
+                'max_density_all': self.max_density_all,
+                # 레거시 호환용
+                'mean_direction': self.mean_direction
             }, f)
-        print(f"[V13] 항적 그리드 저장: {filepath}")
+
+        # 통계 계산
+        total_grids = len(self.count_grid_all)
+        total_by_cat = sum(
+            len(self.count_grid[st][ln])
+            for st in range(self.NUM_SHIPTYPE)
+            for ln in range(self.NUM_LENGTH)
+        )
+
+        print(f"[V13] 항적 밀도 그리드 저장 (선종/길이별): {filepath}")
+        print(f"      전체 통합: {total_grids:,}개 그리드, 최대 밀도: {self.max_density_all:,}")
+        print(f"      선종/길이별: {total_by_cat:,}개 그리드")
 
     def load(self, filepath):
-        """그리드 데이터 로드"""
+        """밀도 그리드 데이터 로드 (레거시 및 새 버전 호환)"""
         import pickle
         if not os.path.exists(filepath):
             return False
@@ -579,12 +921,58 @@ class HistoricalTrackGrid:
         with open(filepath, 'rb') as f:
             data = pickle.load(f)
 
-        self.grid_resolution = data['grid_resolution']
-        self.mean_direction = data['mean_direction']
-        self.count_grid = defaultdict(int, data['count_grid'])
-        self.loaded = True
+        self.grid_resolution = data.get('grid_resolution', 0.01)
+        version = data.get('version', 1)
 
-        print(f"[V13] 항적 그리드 로드: {len(self.mean_direction):,}개 그리드")
+        if version >= 2:
+            # 새 버전: 선종/길이별 분리 구조
+            self.is_legacy = False
+
+            # 선종/길이별 그리드 로드
+            count_grid_data = data.get('count_grid', {})
+            for st in range(self.NUM_SHIPTYPE):
+                for ln in range(self.NUM_LENGTH):
+                    if st in count_grid_data and ln in count_grid_data[st]:
+                        self.count_grid[st][ln] = defaultdict(int, count_grid_data[st][ln])
+
+            # 전체 통합 그리드 로드
+            self.count_grid_all = defaultdict(int, data.get('count_grid_all', {}))
+
+            # 최대 밀도
+            self.max_density = data.get('max_density', {
+                st: {ln: 1 for ln in range(self.NUM_LENGTH)}
+                for st in range(self.NUM_SHIPTYPE)
+            })
+            self.max_density_all = data.get('max_density_all', 1)
+
+            # 통계
+            total_grids = len(self.count_grid_all)
+            total_by_cat = sum(
+                len(self.count_grid[st][ln])
+                for st in range(self.NUM_SHIPTYPE)
+                for ln in range(self.NUM_LENGTH)
+            )
+
+            print(f"[V13] 항적 밀도 그리드 로드 (선종/길이별): {total_grids:,}개 그리드")
+            print(f"      전체 통합 최대 밀도: {self.max_density_all:,}회")
+            print(f"      선종/길이별 그리드: {total_by_cat:,}개")
+
+        else:
+            # 레거시 버전: 단일 그리드
+            self.is_legacy = True
+            self.count_grid_all = defaultdict(int, data.get('count_grid', {}))
+
+            # 레거시 max_density
+            old_max = data.get('max_density', 1)
+            self.max_density_all = old_max
+
+            print(f"[V13] 항적 밀도 그리드 로드 (레거시): {len(self.count_grid_all):,}개 그리드")
+            print(f"      최대 밀도: {self.max_density_all:,}회")
+
+        # 레거시 호환
+        self.mean_direction = data.get('mean_direction', {})
+
+        self.loaded = True
         return True
 
 
@@ -593,28 +981,27 @@ class HistoricalTrackGrid:
 # ============================================
 
 class PathCorrector:
-    """예측 경로 보정 (수심 제약 + 과거 항적 방향) - 급격한 꺾임 방지"""
+    """
+    예측 경로 보정 - 궤적 부드러움 최우선
+
+    핵심 원칙:
+    1. 궤적의 부드러움이 최우선 (점핑 절대 금지)
+    2. 수심 제약은 부드럽게 궤적을 굽히는 방식으로만 적용
+    3. 현재 진행 방향(관성)을 최대한 유지
+    """
 
     def __init__(self, depth_checker=None, track_grid=None):
-        """
-        Args:
-            depth_checker: DepthChecker 인스턴스
-            track_grid: HistoricalTrackGrid 인스턴스
-        """
         self.depth_checker = depth_checker
         self.track_grid = track_grid
 
-        # 보정 제한 파라미터 (급격한 꺾임 방지)
-        self.max_correction_per_step_km = 0.5  # 한 스텝당 최대 보정 거리 (km) - 0.3->0.5 증가
-        self.max_angle_change_deg = 20.0  # 한 스텝당 최대 방향 변화 (도) - 15->20 증가
-        self.smooth_window = 7  # 스무딩 윈도우 크기 (홀수)
-        self.smooth_passes = 2  # 스무딩 반복 횟수
+        # 보정 파라미터
+        self.max_angle_change_deg = 6.0  # 한 스텝당 최대 방향 변화 (도) - 부드러움 우선
+        self.smooth_window = 11  # 스무딩 윈도우 크기 (홀수)
+        self.smooth_passes = 3  # 스무딩 반복 횟수
 
     def set_params(self, max_correction_km=None, max_angle_deg=None,
                    smooth_window=None, smooth_passes=None):
         """보정 파라미터 동적 조정"""
-        if max_correction_km is not None:
-            self.max_correction_per_step_km = max_correction_km
         if max_angle_deg is not None:
             self.max_angle_change_deg = max_angle_deg
         if smooth_window is not None:
@@ -623,117 +1010,447 @@ class PathCorrector:
             self.smooth_passes = smooth_passes
 
     def correct_path(self, predicted_coords, last_position, last_cog=None,
-                     depth_weight=0.7, track_weight=0.3, smooth_factor=0.6):
+                     depth_weight=0.7, track_weight=0.3, smooth_factor=0.3,
+                     shiptype_cat=None, length_cat=None):
         """
-        예측 경로 보정 (점진적 보정으로 급격한 꺾임 방지)
+        예측 경로 보정 - 밀도 기반 + 육지 회피
+
+        원칙:
+        1. 모델 예측을 기본으로 존중
+        2. 밀도가 높은 쪽(실제 항로)으로 부드럽게 유도
+        3. 육지 회피
 
         Args:
-            predicted_coords: (N, 2) 예측 좌표 [lat, lon]
-            last_position: (2,) 마지막 입력 위치
-            last_cog: 마지막 입력 COG (선택)
-            depth_weight: 수심 제약 가중치
-            track_weight: 과거 항적 가중치
-            smooth_factor: 경로 스무딩 강도 (0~1)
+            predicted_coords: 예측된 좌표
+            last_position: 마지막 위치
+            last_cog: 마지막 침로
+            depth_weight: 수심 보정 가중치
+            track_weight: 밀도 보정 가중치
+            smooth_factor: 스무딩 강도
+            shiptype_cat: 선종 카테고리 (0-4)
+            length_cat: 길이 카테고리 (0-8)
 
         Returns:
             (N, 2) 보정된 좌표
         """
         corrected = predicted_coords.copy()
-        n_points = len(corrected)
 
-        # 0. 궤적 수준 육지 회피 (전체 경로가 육지로 향하면 방향 전환)
-        if self.depth_checker is not None:
-            corrected = self._avoid_land_trajectory(corrected, last_position, last_cog)
-
-        # 1. 수심 기반 보정 (점진적)
-        if self.depth_checker is not None:
-            corrected = self._correct_depth_gradual(corrected, last_position)
-
-        # 2. 과거 항적 방향 기반 보정 (점진적)
+        # 1. 밀도 기반 보정 (실제 항로로 유도) - 선종/길이별
         if self.track_grid is not None and self.track_grid.loaded:
-            corrected = self._correct_direction_gradual(corrected, last_position, last_cog, track_weight)
+            corrected = self._apply_density_guidance(corrected, track_weight,
+                                                     shiptype_cat, length_cat)
 
-        # 3. 다중 패스 스무딩 (Gaussian-like)
-        if smooth_factor > 0:
-            for _ in range(self.smooth_passes):
-                corrected = self._smooth_path_gaussian(corrected, smooth_factor)
+        # 2. 가벼운 스무딩 (원본 형태 유지)
+        corrected = self._smooth_path_gaussian(corrected, smooth_factor)
 
-        # 4. 최종 수심 체크 (부드러운 우회)
-        if self.depth_checker is not None:
-            corrected = self._final_depth_check_smooth(corrected, last_position)
+        # 3. 육지 회피 (필요한 경우에만)
+        if self.depth_checker is not None and self.depth_checker.loaded:
+            corrected = self._gentle_land_avoidance(corrected, last_position, last_cog)
 
-        # 5. 방향 연속성 보정 (급격한 각도 변화 완화)
-        corrected = self._ensure_direction_continuity(corrected, last_position, last_cog)
+        # 4. 육지 강제 이동 (육지에 있는 점을 가장 가까운 바다로 이동)
+        if self.depth_checker is not None and self.depth_checker.loaded:
+            corrected = self._force_off_land(corrected)
 
-        # 6. 최종 좌표 유효성 검사 (폭발 방지)
+        # 5. 좌표 유효성 검사
         corrected = self._validate_coordinates(corrected, predicted_coords, last_position)
 
         return corrected
 
-    def _avoid_land_trajectory(self, coords, last_position, last_cog):
+    def _apply_density_guidance(self, coords, strength=0.3,
+                                shiptype_cat=None, length_cat=None):
         """
-        궤적 수준 육지 회피
-        - 전체 경로가 육지로 향하는지 감지
-        - 육지로 향하면 방향을 틀어서 회피
+        밀도 기반 경로 보정 - 밀도가 높은 쪽(실제 항로)으로 유도
+
+        각 예측 점에서:
+        - 주변 격자의 밀도를 확인 (선종/길이별)
+        - 밀도가 높은 방향으로 살짝 끌어당김
+
+        Args:
+            coords: 좌표 배열
+            strength: 보정 강도
+            shiptype_cat: 선종 카테고리 (0-4)
+            length_cat: 길이 카테고리 (0-8)
         """
-        if self.depth_checker is None or self.depth_checker.kdtree is None:
+        if not self.track_grid or not self.track_grid.loaded:
             return coords
 
-        corrected = coords.copy()
-        n_points = len(corrected)
+        result = coords.copy()
+        grid_res = self.track_grid.grid_resolution
 
-        # 종점 및 중간점 육지 여부 확인
-        end_point = corrected[-1]
-        mid_point = corrected[n_points // 2]
+        for i in range(len(coords)):
+            lat, lon = coords[i]
 
-        end_navigable = self.depth_checker.is_navigable(end_point[0], end_point[1])
-        mid_navigable = self.depth_checker.is_navigable(mid_point[0], mid_point[1])
+            # 밀도 기울기 계산 (선종/길이별)
+            gradient = self.track_grid.get_density_gradient(lat, lon,
+                                                            shiptype_cat, length_cat)
 
-        # 종점 또는 중간점이 육지면 궤적 전체를 회전
-        if not end_navigable or not mid_navigable:
-            # 현재 진행 방향 계산
-            if last_cog is not None:
-                current_direction = last_cog
+            if gradient is None:
+                continue
+
+            dlat, dlon, grad_strength = gradient
+
+            # 보정량 계산 (최대 격자 1칸의 절반까지만)
+            max_shift = grid_res * 0.5
+            shift_amount = max_shift * strength * grad_strength
+
+            # 위치 조정 (밀도 높은 쪽으로)
+            result[i, 0] = lat + dlat * shift_amount
+            result[i, 1] = lon + dlon * shift_amount
+
+        return result
+
+    def _apply_track_grid_guidance(self, coords, last_position, last_cog, track_weight=0.5):
+        """
+        [레거시] COG 기반 경로 조정 - 호환성용
+
+        해당 그리드에서 과거 선박들이 주로 이동한 방향으로 궤적을 유도
+        """
+        if not self.track_grid or not self.track_grid.loaded:
+            return coords
+
+        result = coords.copy()
+        n_points = len(coords)
+
+        # 1단계: 각 점에서의 과거 항적 방향 수집 (주변 그리드 평균)
+        track_directions = []
+        for i in range(n_points):
+            lat, lon = coords[i]
+            smoothed_dir = self._get_smoothed_track_direction(lat, lon)
+            track_directions.append(smoothed_dir)
+
+        # 2단계: 수집된 방향들을 추가로 스무딩 (궤적 수준에서)
+        smoothed_track_dirs = self._smooth_directions(track_directions)
+
+        # 3단계: 스무딩된 과거 항적 방향을 적용
+        if last_cog is not None:
+            prev_cog = last_cog
+        else:
+            dlat = coords[0, 0] - last_position[0]
+            dlon = coords[0, 1] - last_position[1]
+            if abs(dlat) > 1e-9 or abs(dlon) > 1e-9:
+                prev_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
             else:
-                dlat = corrected[0, 0] - last_position[0]
-                dlon = corrected[0, 1] - last_position[1]
-                current_direction = np.degrees(np.arctan2(dlon, dlat)) % 360
+                prev_cog = 0.0
 
-            # 여러 방향으로 회전 시도 (+30, -30, +60, -60, +90, -90도)
-            best_coords = None
-            best_score = -1
+        prev_pos = last_position.copy()
 
-            for angle_offset in [30, -30, 60, -60, 90, -90, 120, -120]:
-                rotated = self._rotate_trajectory(
-                    coords, last_position, current_direction, angle_offset
-                )
+        for i in range(n_points):
+            # 원본에서 이 점까지의 거리와 방향
+            dlat = coords[i, 0] - prev_pos[0]
+            dlon = coords[i, 1] - prev_pos[1]
+            dist = np.sqrt(dlat**2 + dlon**2)
 
-                # 회전된 궤적의 항해 가능 점수 계산
-                navigable_count = 0
-                for i in range(0, n_points, 5):  # 5분 간격으로 체크
-                    if self.depth_checker.is_navigable(rotated[i, 0], rotated[i, 1], check_neighbors=False):
-                        navigable_count += 1
+            if dist < 1e-9:
+                result[i] = prev_pos.copy()
+                continue
 
-                # 중간점과 종점 가중치 추가
-                if self.depth_checker.is_navigable(rotated[n_points // 2, 0], rotated[n_points // 2, 1]):
-                    navigable_count += 3
-                if self.depth_checker.is_navigable(rotated[-1, 0], rotated[-1, 1]):
-                    navigable_count += 5
+            original_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
 
-                # 작은 각도 보너스 (자연스러운 회전 선호)
-                angle_penalty = abs(angle_offset) / 180.0
-                score = navigable_count - angle_penalty * 2
+            track_dir = smoothed_track_dirs[i]
 
+            if track_dir is not None:
+                track_cog = track_dir['cog']
+                consistency = track_dir['consistency']
+
+                # 일관성에 따라 가중치 조정 (더 보수적으로)
+                effective_weight = track_weight * consistency * 0.7
+
+                # 현재 방향과 과거 항적 방향의 차이
+                angle_diff_track = ((track_cog - prev_cog + 180) % 360) - 180
+
+                # 원본 방향과의 차이
+                angle_diff_original = ((original_cog - prev_cog + 180) % 360) - 180
+
+                # 두 방향을 블렌딩
+                blended_diff = angle_diff_original * (1 - effective_weight) + angle_diff_track * effective_weight
+
+                # 최대 방향 변화 제한 (스텝당 8도로 줄임)
+                max_change = 8.0
+                if abs(blended_diff) > max_change:
+                    blended_diff = max_change * np.sign(blended_diff)
+
+                new_cog = (prev_cog + blended_diff) % 360
+            else:
+                # 과거 항적 없으면 원본 방향 유지
+                angle_diff = ((original_cog - prev_cog + 180) % 360) - 180
+                max_change = 6.0
+                if abs(angle_diff) > max_change:
+                    angle_diff = max_change * np.sign(angle_diff)
+                new_cog = (prev_cog + angle_diff) % 360
+
+            new_cog_rad = np.radians(new_cog)
+
+            # 새 위치 계산
+            result[i, 0] = prev_pos[0] + dist * np.cos(new_cog_rad)
+            result[i, 1] = prev_pos[1] + dist * np.sin(new_cog_rad)
+
+            prev_pos = result[i].copy()
+            prev_cog = new_cog
+
+        return result
+
+    def _get_smoothed_track_direction(self, lat, lon):
+        """주변 그리드들의 방향을 평균하여 부드러운 방향 반환"""
+        if not self.track_grid or not self.track_grid.loaded:
+            return None
+
+        # 현재 위치와 주변 8방향 그리드 확인
+        grid_res = self.track_grid.grid_resolution
+        offsets = [
+            (0, 0),  # 현재 위치
+            (grid_res, 0), (-grid_res, 0),
+            (0, grid_res), (0, -grid_res),
+            (grid_res, grid_res), (grid_res, -grid_res),
+            (-grid_res, grid_res), (-grid_res, -grid_res)
+        ]
+
+        cogs = []
+        weights = []
+
+        for dlat, dlon in offsets:
+            info = self.track_grid.get_preferred_direction(lat + dlat, lon + dlon)
+            if info is not None:
+                cogs.append(info['cog'])
+                # 중심에 가까울수록 높은 가중치, 일관성도 반영
+                dist_weight = 1.0 if dlat == 0 and dlon == 0 else 0.5
+                weights.append(dist_weight * info['consistency'])
+
+        if not cogs:
+            return None
+
+        # 원형 평균 계산
+        weights = np.array(weights)
+        weights = weights / weights.sum()
+
+        cog_rad = np.radians(cogs)
+        mean_sin = np.sum(np.sin(cog_rad) * weights)
+        mean_cos = np.sum(np.cos(cog_rad) * weights)
+        mean_cog = np.degrees(np.arctan2(mean_sin, mean_cos)) % 360
+
+        # 평균 일관성
+        avg_consistency = np.mean([w for w in weights]) * len(weights) / 9
+
+        return {
+            'cog': mean_cog,
+            'consistency': min(avg_consistency, 1.0)
+        }
+
+    def _smooth_directions(self, track_directions):
+        """궤적 수준에서 방향들을 스무딩"""
+        n = len(track_directions)
+        if n < 3:
+            return track_directions
+
+        smoothed = track_directions.copy()
+        window = 5  # 앞뒤 2개씩 고려
+
+        for i in range(n):
+            # 윈도우 범위
+            start = max(0, i - window // 2)
+            end = min(n, i + window // 2 + 1)
+
+            # 유효한 방향들 수집
+            valid_dirs = [track_directions[j] for j in range(start, end) if track_directions[j] is not None]
+
+            if not valid_dirs:
+                continue
+
+            # 원형 평균 계산
+            cogs = [d['cog'] for d in valid_dirs]
+            consistencies = [d['consistency'] for d in valid_dirs]
+
+            cog_rad = np.radians(cogs)
+            mean_sin = np.mean(np.sin(cog_rad))
+            mean_cos = np.mean(np.cos(cog_rad))
+            mean_cog = np.degrees(np.arctan2(mean_sin, mean_cos)) % 360
+
+            smoothed[i] = {
+                'cog': mean_cog,
+                'consistency': np.mean(consistencies)
+            }
+
+        return smoothed
+
+    def _enforce_direction_continuity(self, coords, last_position, last_cog):
+        """
+        방향 연속성 강제 - 궤적이 부드럽게 이어지도록
+        각 점이 이전 점으로부터 자연스러운 방향으로만 이동
+        """
+        if len(coords) < 2:
+            return coords
+
+        result = coords.copy()
+
+        # 초기 방향 설정
+        if last_cog is not None:
+            prev_cog = last_cog
+        else:
+            dlat = coords[0, 0] - last_position[0]
+            dlon = coords[0, 1] - last_position[1]
+            if abs(dlat) > 1e-9 or abs(dlon) > 1e-9:
+                prev_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
+            else:
+                prev_cog = 0.0
+
+        prev_pos = last_position.copy()
+
+        for i in range(len(coords)):
+            # 원본에서 이 점까지의 거리 계산
+            dlat = coords[i, 0] - prev_pos[0]
+            dlon = coords[i, 1] - prev_pos[1]
+            dist = np.sqrt(dlat**2 + dlon**2)
+
+            if dist < 1e-9:
+                result[i] = prev_pos.copy()
+                continue
+
+            # 원본의 방향
+            original_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
+
+            # 이전 방향과의 차이
+            angle_diff = ((original_cog - prev_cog + 180) % 360) - 180
+
+            # 최대 방향 변화 제한
+            if abs(angle_diff) > self.max_angle_change_deg:
+                angle_diff = self.max_angle_change_deg * np.sign(angle_diff)
+
+            # 새 방향 계산
+            new_cog = (prev_cog + angle_diff) % 360
+            new_cog_rad = np.radians(new_cog)
+
+            # 새 위치 계산
+            result[i, 0] = prev_pos[0] + dist * np.cos(new_cog_rad)
+            result[i, 1] = prev_pos[1] + dist * np.sin(new_cog_rad)
+
+            prev_pos = result[i].copy()
+            prev_cog = new_cog
+
+        return result
+
+    def _gentle_land_avoidance(self, coords, last_position, last_cog):
+        """
+        부드러운 육지 회피 - 실제 육지(elevation >= 0)일 때만 회피
+
+        주의: 얕은 물(수심 < 10m)은 회피하지 않음 - 실제로 항해 가능한 경우가 많음
+        """
+        if not self.depth_checker or not self.depth_checker.loaded:
+            return coords
+
+        n_points = len(coords)
+
+        # 실제 육지에 닿는 점 찾기 (is_land 사용 - elevation >= 0)
+        land_indices = []
+        for i in range(n_points):
+            if self.depth_checker.is_land(coords[i, 0], coords[i, 1]):
+                land_indices.append(i)
+
+        if not land_indices:
+            return coords  # 육지 없음
+
+        # 첫 번째 육지 접촉 지점
+        first_land_idx = land_indices[0]
+
+        if first_land_idx <= 1:
+            # 시작부터 육지면 전체 회전 시도
+            return self._rotate_to_avoid_land(coords, last_position, last_cog)
+
+        # 육지 접촉 전까지는 유지, 이후부터 점진적으로 굽힘
+        result = coords.copy()
+
+        # 육지 직전 방향 계산
+        safe_idx = max(0, first_land_idx - 2)
+        if safe_idx > 0:
+            dlat = coords[safe_idx, 0] - coords[safe_idx - 1, 0]
+            dlon = coords[safe_idx, 1] - coords[safe_idx - 1, 1]
+        else:
+            dlat = coords[safe_idx, 0] - last_position[0]
+            dlon = coords[safe_idx, 1] - last_position[1]
+
+        if abs(dlat) < 1e-9 and abs(dlon) < 1e-9:
+            return coords
+
+        current_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
+
+        # 회피 방향 결정 (좌/우 중 더 나은 쪽)
+        best_offset = 0
+        best_score = -1
+
+        for test_offset in [10, -10, 20, -20, 30, -30]:
+            test_cog = (current_cog + test_offset) % 360
+            test_cog_rad = np.radians(test_cog)
+
+            # 테스트 점 계산 (육지 접촉 지점에서)
+            test_lat = coords[safe_idx, 0] + 0.05 * np.cos(test_cog_rad)
+            test_lon = coords[safe_idx, 1] + 0.05 * np.sin(test_cog_rad)
+
+            # 실제 육지가 아니면 OK (is_land 사용)
+            if not self.depth_checker.is_land(test_lat, test_lon):
+                score = 1.0 / (abs(test_offset) + 1)  # 작은 각도 선호
                 if score > best_score:
                     best_score = score
-                    best_coords = rotated
+                    best_offset = test_offset
 
-            if best_coords is not None and best_score > 5:
-                return best_coords
+        if best_offset == 0:
+            return coords  # 회피 방향 찾지 못함
 
-        return corrected
+        # 육지 접촉 지점부터 점진적으로 방향 수정
+        prev_pos = result[safe_idx].copy()
+        prev_cog = current_cog
 
-    def _rotate_trajectory(self, coords, center, base_angle, offset_deg):
+        for i in range(safe_idx + 1, n_points):
+            # 원본 거리
+            dlat = coords[i, 0] - coords[i - 1, 0]
+            dlon = coords[i, 1] - coords[i - 1, 1]
+            dist = np.sqrt(dlat**2 + dlon**2)
+
+            # 점진적으로 회피 방향으로 틀기
+            progress = (i - safe_idx) / (n_points - safe_idx)
+            angle_adjust = best_offset * min(progress * 2, 1.0)  # 최대 best_offset까지
+
+            new_cog = (prev_cog + angle_adjust * 0.3) % 360  # 매우 점진적
+            new_cog_rad = np.radians(new_cog)
+
+            result[i, 0] = prev_pos[0] + dist * np.cos(new_cog_rad)
+            result[i, 1] = prev_pos[1] + dist * np.sin(new_cog_rad)
+
+            prev_pos = result[i].copy()
+            prev_cog = new_cog
+
+        return result
+
+    def _rotate_to_avoid_land(self, coords, last_position, last_cog):
+        """시작부터 육지인 경우 전체 궤적을 부드럽게 회전"""
+        if last_cog is None:
+            dlat = coords[0, 0] - last_position[0]
+            dlon = coords[0, 1] - last_position[1]
+            if abs(dlat) > 1e-9 or abs(dlon) > 1e-9:
+                last_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
+            else:
+                return coords
+
+        # 여러 각도로 회전 시도
+        best_coords = coords
+        best_score = 0
+
+        for angle_offset in [15, -15, 30, -30, 45, -45, 60, -60]:
+            rotated = self._rotate_trajectory(coords, last_position, angle_offset)
+
+            # 육지가 아닌 점 개수 계산 (is_land 사용)
+            non_land_count = 0
+            for i in range(0, len(rotated), 5):
+                if not self.depth_checker.is_land(rotated[i, 0], rotated[i, 1]):
+                    non_land_count += 1
+
+            # 작은 각도 보너스
+            score = non_land_count - abs(angle_offset) / 60.0
+
+            if score > best_score:
+                best_score = score
+                best_coords = rotated
+
+        return best_coords
+
+    def _rotate_trajectory(self, coords, center, offset_deg):
         """궤적을 중심점 기준으로 회전"""
         rotated = coords.copy()
         offset_rad = np.radians(offset_deg)
@@ -755,6 +1472,30 @@ class PathCorrector:
             rotated[i, 1] = center[1] + new_dlon
 
         return rotated
+
+    def _force_off_land(self, coords):
+        """
+        육지에 있는 점을 강제로 가장 가까운 바다로 이동
+
+        이 함수는 모든 보정 후 마지막에 실행되어
+        여전히 육지에 있는 점을 강제로 이동시킴
+        """
+        if not self.depth_checker or not self.depth_checker.loaded:
+            return coords
+
+        result = coords.copy()
+
+        for i in range(len(coords)):
+            lat, lon = coords[i, 0], coords[i, 1]
+
+            # 육지인 경우 가장 가까운 항해 가능 지점으로 이동
+            if self.depth_checker.is_land(lat, lon):
+                nearest = self.depth_checker.find_nearest_navigable(lat, lon, max_search_radius=0.1)
+                if nearest is not None:
+                    result[i, 0] = nearest[0]
+                    result[i, 1] = nearest[1]
+
+        return result
 
     def _validate_coordinates(self, corrected, original, last_position):
         """좌표 유효성 검사 - 비정상 좌표는 원본으로 복원"""
@@ -787,122 +1528,6 @@ class PathCorrector:
                 continue
 
         return result
-
-    def _correct_depth_gradual(self, coords, last_position):
-        """수심 기반 점진적 경로 보정 (급격한 이동 방지)"""
-        corrected = coords.copy()
-        prev_valid = last_position.copy()
-
-        # 위도 1도 ≈ 111km, 경도 1도 ≈ 88km (한국 위도 기준)
-        max_lat_change = self.max_correction_per_step_km / 111.0
-        max_lon_change = self.max_correction_per_step_km / 88.0
-
-        for i in range(len(corrected)):
-            lat, lon = corrected[i]
-            original_lat, original_lon = lat, lon
-
-            if not self.depth_checker.is_navigable(lat, lon):
-                # 항해 불가능 → 가장 가까운 항해 가능 지점 찾기
-                nearest = self.depth_checker.find_nearest_navigable(lat, lon)
-
-                if nearest is not None:
-                    target_lat, target_lon = nearest
-
-                    # 보정량 계산
-                    dlat = target_lat - lat
-                    dlon = target_lon - lon
-
-                    # 최대 보정량 제한 (점진적 이동)
-                    if abs(dlat) > max_lat_change:
-                        dlat = max_lat_change * np.sign(dlat)
-                    if abs(dlon) > max_lon_change:
-                        dlon = max_lon_change * np.sign(dlon)
-
-                    corrected[i, 0] = lat + dlat
-                    corrected[i, 1] = lon + dlon
-                else:
-                    # 찾지 못하면 이전 유효 위치 방향으로 점진적 이동
-                    dlat = (prev_valid[0] - lat) * 0.3
-                    dlon = (prev_valid[1] - lon) * 0.3
-
-                    # 최대 보정량 제한
-                    if abs(dlat) > max_lat_change:
-                        dlat = max_lat_change * np.sign(dlat)
-                    if abs(dlon) > max_lon_change:
-                        dlon = max_lon_change * np.sign(dlon)
-
-                    corrected[i, 0] = lat + dlat
-                    corrected[i, 1] = lon + dlon
-
-            # 유효 위치 업데이트 (항해 가능한 경우에만)
-            if self.depth_checker.is_navigable(corrected[i, 0], corrected[i, 1]):
-                prev_valid = corrected[i].copy()
-
-        return corrected
-
-    def _correct_direction_gradual(self, coords, last_position, last_cog, weight):
-        """과거 항적 방향 기반 점진적 보정 (급격한 방향 전환 방지)"""
-        corrected = coords.copy()
-
-        # 이전 보정 각도 (관성 유지용)
-        prev_correction = 0.0
-
-        for i in range(len(corrected)):
-            lat, lon = corrected[i]
-
-            # 과거 항적의 선호 방향 조회
-            pref = self.track_grid.get_preferred_direction(lat, lon)
-
-            if pref is None:
-                # 과거 항적 정보 없으면 이전 보정 관성 유지 (감쇠)
-                prev_correction *= 0.8
-                continue
-
-            # 현재 이동 방향 계산
-            if i == 0:
-                prev_lat, prev_lon = last_position
-            else:
-                prev_lat, prev_lon = corrected[i-1]
-
-            dlat = lat - prev_lat
-            dlon = lon - prev_lon
-
-            if abs(dlat) < 1e-7 and abs(dlon) < 1e-7:
-                prev_correction *= 0.8
-                continue
-
-            current_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
-            pref_cog = pref['cog']
-            consistency = pref['consistency']
-
-            # 방향 차이 계산 (각도 차이, -180~180)
-            angle_diff = ((pref_cog - current_cog + 180) % 360) - 180
-
-            # 방향 차이가 크면 (90도 이상) 보정하지 않음 (역주행 방지)
-            if abs(angle_diff) > 90:
-                prev_correction *= 0.5
-                continue
-
-            # 목표 보정량 계산 (일관성과 가중치 적용)
-            target_correction = angle_diff * weight * consistency * 0.3
-
-            # 점진적 보정: 이전 보정과 목표 보정의 블렌딩
-            # + 최대 각도 변화 제한
-            correction_change = target_correction - prev_correction
-            if abs(correction_change) > self.max_angle_change_deg:
-                correction_change = self.max_angle_change_deg * np.sign(correction_change)
-
-            correction = prev_correction + correction_change * 0.5
-            prev_correction = correction
-
-            # 새로운 방향으로 좌표 보정
-            dist = np.sqrt(dlat**2 + dlon**2)
-            new_cog = np.radians(current_cog + correction)
-
-            corrected[i, 0] = prev_lat + dist * np.cos(new_cog)
-            corrected[i, 1] = prev_lon + dist * np.sin(new_cog)
-
-        return corrected
 
     def _smooth_path_gaussian(self, coords, factor):
         """Gaussian 가중치 기반 경로 스무딩 (급격한 꺾임 완화)"""
@@ -940,147 +1565,6 @@ class PathCorrector:
 
         return smoothed
 
-    def _final_depth_check_smooth(self, coords, last_position):
-        """최종 수심 체크 및 부드러운 우회 보정"""
-        corrected = coords.copy()
-        prev_valid = last_position.copy()
-
-        # 이전 이동 방향 (관성 유지용)
-        prev_direction = None
-
-        for i in range(len(corrected)):
-            lat, lon = corrected[i]
-
-            # 현재 이동 방향 계산
-            if i > 0:
-                prev_direction = np.array([lat - corrected[i-1, 0], lon - corrected[i-1, 1]])
-            elif prev_direction is None:
-                prev_direction = np.array([lat - last_position[0], lon - last_position[1]])
-
-            if not self.depth_checker.is_navigable(lat, lon):
-                # 부드러운 우회: 여러 방향 시도
-                best_pos = None
-                best_score = -np.inf
-
-                # 더 세밀한 alpha 값 (점진적 접근)
-                for alpha in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
-                    mid_lat = prev_valid[0] * alpha + lat * (1 - alpha)
-                    mid_lon = prev_valid[1] * alpha + lon * (1 - alpha)
-
-                    if self.depth_checker.is_navigable(mid_lat, mid_lon):
-                        # 방향 유지도 점수 계산 (진행 방향과 일치할수록 높은 점수)
-                        if prev_direction is not None and np.linalg.norm(prev_direction) > 1e-7:
-                            new_dir = np.array([mid_lat - prev_valid[0], mid_lon - prev_valid[1]])
-                            if np.linalg.norm(new_dir) > 1e-7:
-                                cos_sim = np.dot(prev_direction, new_dir) / (
-                                    np.linalg.norm(prev_direction) * np.linalg.norm(new_dir))
-                                score = (1 - alpha) + cos_sim * 0.5  # 원래 위치 + 방향 유지
-                            else:
-                                score = (1 - alpha)
-                        else:
-                            score = (1 - alpha)
-
-                        if score > best_score:
-                            best_score = score
-                            best_pos = [mid_lat, mid_lon]
-
-                if best_pos is not None:
-                    corrected[i] = best_pos
-                else:
-                    # 중간점도 불가능하면 이전 위치에서 약간만 이동
-                    corrected[i, 0] = prev_valid[0] + prev_direction[0] * 0.1
-                    corrected[i, 1] = prev_valid[1] + prev_direction[1] * 0.1
-
-            # 유효 위치 업데이트
-            if self.depth_checker.is_navigable(corrected[i, 0], corrected[i, 1]):
-                prev_valid = corrected[i].copy()
-
-        return corrected
-
-    def _ensure_direction_continuity(self, coords, last_position, last_cog):
-        """방향 연속성 보장 (급격한 각도 변화 완화) - 안정화 버전"""
-        if len(coords) < 3:
-            return coords
-
-        corrected = coords.copy()
-        original_coords = coords.copy()  # 원본 보존
-
-        # 좌표 유효 범위 (한국 근해)
-        LAT_MIN, LAT_MAX = 30.0, 40.0
-        LON_MIN, LON_MAX = 120.0, 135.0
-
-        # 전체 이동 거리 계산 (저속 선박 판별용)
-        total_dist = np.sqrt(
-            (coords[-1, 0] - coords[0, 0])**2 +
-            (coords[-1, 1] - coords[0, 1])**2
-        )
-
-        # 저속 선박 (60분간 0.01도 = ~1km 미만 이동)이면 방향 보정 스킵
-        # 작은 움직임에 방향 보정 적용하면 진동 발생
-        if total_dist < 0.01:
-            return coords
-
-        # 이전 방향 초기화
-        if last_cog is not None:
-            prev_cog = last_cog
-        else:
-            dlat = coords[0, 0] - last_position[0]
-            dlon = coords[0, 1] - last_position[1]
-            if abs(dlat) < 1e-9 and abs(dlon) < 1e-9:
-                prev_cog = 0.0
-            else:
-                prev_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
-
-        # 기준 위치 (last_position에서 시작)
-        base_lat, base_lon = last_position[0], last_position[1]
-
-        for i in range(1, len(coords)):
-            prev_lat, prev_lon = corrected[i-1]
-            lat, lon = original_coords[i]  # 원본 좌표 사용
-
-            # 좌표 유효성 검사
-            if not (LAT_MIN <= prev_lat <= LAT_MAX and LON_MIN <= prev_lon <= LON_MAX):
-                # 이전 좌표가 유효하지 않으면 원본 사용
-                corrected[i] = original_coords[i].copy()
-                continue
-
-            dlat = lat - prev_lat
-            dlon = lon - prev_lon
-            dist = np.sqrt(dlat**2 + dlon**2)
-
-            # 거리가 너무 작거나 너무 크면 스킵 (저속 선박 보호)
-            if dist < 0.0001 or dist > 0.1:  # 0.0001도 ≈ 11m, 0.1도 ≈ 11km
-                corrected[i] = original_coords[i].copy()
-                continue
-
-            current_cog = np.degrees(np.arctan2(dlon, dlat)) % 360
-
-            # 방향 변화 계산
-            angle_diff = ((current_cog - prev_cog + 180) % 360) - 180
-
-            # 최대 각도 변화 제한
-            if abs(angle_diff) > self.max_angle_change_deg:
-                limited_diff = self.max_angle_change_deg * np.sign(angle_diff)
-                new_cog = (prev_cog + limited_diff) % 360
-                new_cog_rad = np.radians(new_cog)
-
-                new_lat = prev_lat + dist * np.cos(new_cog_rad)
-                new_lon = prev_lon + dist * np.sin(new_cog_rad)
-
-                # 새 좌표 유효성 검사
-                if LAT_MIN <= new_lat <= LAT_MAX and LON_MIN <= new_lon <= LON_MAX:
-                    corrected[i, 0] = new_lat
-                    corrected[i, 1] = new_lon
-                    prev_cog = new_cog
-                else:
-                    # 유효하지 않으면 원본 유지
-                    corrected[i] = original_coords[i].copy()
-                    prev_cog = current_cog
-            else:
-                prev_cog = current_cog
-
-        return corrected
-
 
 # ============================================
 # V13 예측기 클래스
@@ -1116,7 +1600,7 @@ class TrajectoryPredictorV13(TrajectoryPredictorV12):
         self.depth_checker = DepthChecker(depth_file, region=self.region)
 
         # 과거 항적 그리드 초기화
-        self.track_grid = HistoricalTrackGrid(grid_resolution=0.01)
+        self.track_grid = HistoricalTrackGrid(grid_resolution=0.0001)
 
         # 저장된 그리드 파일이 있으면 로드
         if track_grid_file and os.path.exists(track_grid_file):
@@ -1163,7 +1647,7 @@ class TrajectoryPredictorV13(TrajectoryPredictorV12):
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             data_dir = os.path.join(base_dir, "학습데이터_전처리", "v12")
 
-        self.track_grid = HistoricalTrackGrid(grid_resolution=0.01)
+        self.track_grid = HistoricalTrackGrid(grid_resolution=0.0001)
         self.track_grid.load_from_training_data(data_dir, self.region)
 
         if save_path is None:
@@ -1197,6 +1681,10 @@ class TrajectoryPredictorV13(TrajectoryPredictorV12):
         result = super().predict(input_data, shiptype=shiptype, length=length,
                                   interpolate=interpolate)
 
+        # 선종/길이 카테고리 계산 (밀도 그리드 조회용)
+        shiptype_cat = get_shiptype_category(shiptype) if shiptype is not None else None
+        length_cat = get_length_category(length) if length is not None else None
+
         # 보정 여부 결정
         do_correction = enable_correction if enable_correction is not None else self.enable_correction
 
@@ -1211,12 +1699,14 @@ class TrajectoryPredictorV13(TrajectoryPredictorV12):
             else:
                 last_cog = None
 
-            # 경로 보정
+            # 경로 보정 (선종/길이별 밀도 그리드 참조)
             original_coords = result['predicted_coords'].copy()
             corrected_coords = self.path_corrector.correct_path(
                 result['predicted_coords'],
                 result['last_position'],
-                last_cog=last_cog
+                last_cog=last_cog,
+                shiptype_cat=shiptype_cat,
+                length_cat=length_cat
             )
 
             result['predicted_coords'] = corrected_coords
